@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Live demo
+    url: https://YOUR-USERNAME.github.io/civicconnect/
+    about: Try the app before filing an issue — every feature is reachable without an account.
+  - name: How to swap in a real backend
+    url: https://github.com/YOUR-USERNAME/civicconnect/blob/main/docs/BACKEND.md
+    about: FastAPI + Supabase + PostGIS + Gemini mapping for every mocked service.
+  - name: Publishing / CI questions
+    url: https://github.com/YOUR-USERNAME/civicconnect/blob/main/docs/PUSH.md
+    about: Pushing to GitHub, enabling Pages, and what the four CI checks do.

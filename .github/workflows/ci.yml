@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build + audit + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rebuild index.html from parts/
+        run: python3 build.py
+
+      - name: index.html must be up to date
+        run: |
+          if ! git diff --quiet -- index.html; then
+            echo "::error::index.html is out of date. Run 'python3 build.py' and commit the result."
+            git --no-pager diff --stat -- index.html
+            exit 1
+          fi
+
+      - name: Static audit (ids, icons, i18n keys, leftovers)
+        run: python3 tools/audit.py
+
+      - name: Service-layer tests (AI, duplicates, state machine, RBAC)
+        run: node tools/test_services.js
+
+      - name: View + guided-demo tests
+        run: node tools/test_views.js
+
+      - name: Upload the single-file app
+        uses: actions/upload-artifact@v4
+        with:
+          name: civicconnect-single-file
+          path: index.html
+          if-no-files-found: error
