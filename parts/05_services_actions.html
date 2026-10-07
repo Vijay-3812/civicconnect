@@ -1,0 +1,603 @@
+/* ==========================================================================
+ * 4. SERVICES — AI (deterministic, swap-ready), duplicates, priority, summary
+ *    Each function is pure: same input → same output. Replace the body with a
+ *    fetch() to FastAPI/Gemini and keep the return shape (see header notes).
+ * ======================================================================== */
+const Services = (() => {
+
+  /* ---------- 4.1 Bilingual keyword dictionaries ---------- */
+  const STOP = new Set(`a an the is are was were be been being i we you they he she it this that these those of to in on at for with from by as and or but not no nor if then than so too very can could should would will just about into over under again more most some such only own same our their its his her them us my your me do does did done have has had having there here what which who whom when where why how all any both each few other`.split(' '));
+  const STOP_TA = new Set('இந்த அந்த ஒரு என்று மற்றும் ஆனால் அல்லது இல்லை என்பது உள்ள என ஒரு அது இது நான் நாங்கள் அவர் அவள் அவர்கள் மிக மிகவும் ஆகும் உள்ளது என்ற முதல் வரை பற்றி இருந்து'.split(' '));
+
+  /** Category → weighted phrases. `w` = evidence weight (1 = strong, .5 = weak). */
+  const KEYWORDS = {
+    'road damage': [
+      { p: 'pothole', w: 1 }, { p: 'pot hole', w: 1 }, { p: 'road damage', w: 1 }, { p: 'road is damaged', w: 1 },
+      { p: 'crack', w: .7 }, { p: 'tar', w: .5 }, { p: 'asphalt', w: .8 }, { p: 'speed breaker', w: .5 }, { p: 'footpath', w: .6 },
+      { p: 'bus bay', w: .5 }, { p: 'patch work', w: .8 }, { p: 'road repair', w: 1 }, { p: 'uneven road', w: .9 },
+      { p: 'குழி', w: 1 }, { p: 'சாலை சேதம்', w: 1 }, { p: 'சாலையில்', w: .6 }, { p: 'பள்ளம்', w: 1 }, { p: 'சரிவு', w: .5 }
+    ],
+    waste: [
+      { p: 'garbage', w: 1 }, { p: 'trash', w: 1 }, { p: 'rubbish', w: 1 }, { p: 'waste', w: .8 }, { p: 'bin', w: .7 },
+      { p: 'dump', w: .8 }, { p: 'litter', w: .8 }, { p: 'debris', w: .7 }, { p: 'smell', w: .6 }, { p: 'stray dog', w: .6 },
+      { p: 'burning waste', w: 1 }, { p: 'collection', w: .4 }, { p: 'sweeping', w: .6 },
+      { p: 'குப்பை', w: 1 }, { p: 'கழிவு', w: 1 }, { p: 'சுத்தம்', w: .7 }, { p: 'தொழுவாரி', w: .6 }, { p: 'நாற்றம்', w: .6 }
+    ],
+    drainage: [
+      { p: 'drain', w: 1 }, { p: 'drainage', w: 1 }, { p: 'sewage', w: 1 }, { p: 'sewer', w: 1 }, { p: 'manhole', w: .9 },
+      { p: 'overflowing', w: .9 }, { p: 'blocked drain', w: 1 }, { p: 'stagnant', w: .8 }, { p: 'desilt', w: 1 }, { p: 'silt', w: .9 },
+      { p: 'flood', w: .9 }, { p: 'storm water', w: 1 }, { p: 'gutter', w: .9 },
+      { p: 'வடிகால்', w: 1 }, { p: 'கழிவுநீர்', w: 1 }, { p: 'சாக்கடை', w: 1 }, { p: 'மழைநீர்', w: .7 }, { p: 'தூர்வார', w: 1 }
+    ],
+    water: [
+      { p: 'water', w: .8 }, { p: 'no water', w: 1 }, { p: 'water supply', w: 1 }, { p: 'leak', w: .9 }, { p: 'leakage', w: 1 },
+      { p: 'pipeline', w: .9 }, { p: 'pipe', w: .7 }, { p: 'borewell', w: .8 }, { p: 'tap', w: .7 }, { p: 'contaminated', w: 1 },
+      { p: 'yellow water', w: 1 }, { p: 'pressure', w: .7 }, { p: 'drinking water', w: 1 },
+      { p: 'தண்ணீர்', w: 1 }, { p: 'தண்ணீர் கசிவு', w: 1 }, { p: 'கசிவு', w: 1 }, { p: 'குழாய்', w: .9 }, { p: 'குடிநீர்', w: 1 }, { p: 'அழுக்கு நீர்', w: 1 }
+    ],
+    streetlight: [
+      { p: 'street light', w: 1 }, { p: 'streetlight', w: 1 }, { p: 'lamp', w: .9 }, { p: 'lamp post', w: 1 }, { p: 'dark', w: .7 },
+      { p: 'no light', w: 1 }, { p: 'flicker', w: .9 }, { p: 'bulb', w: .8 }, { p: 'pole', w: .6 }, { p: 'light not working', w: 1 },
+      { p: 'new street light', w: 1 }, { p: 'electric pole', w: .6 },
+      { p: 'தெருவிளக்கு', w: 1 }, { p: 'விளக்கு', w: .9 }, { p: 'இருட்டு', w: .8 }, { p: 'மின் கம்பம்', w: .7 }
+    ],
+    'public safety': [
+      { p: 'accident', w: 1 }, { p: 'live wire', w: 1 }, { p: 'shock', w: .9 }, { p: 'danger', w: .9 }, { p: 'dangerous', w: .9 },
+      { p: 'safety', w: .8 }, { p: 'open drain', w: 1 }, { p: 'missing cover', w: 1 }, { p: 'injury', w: .9 }, { p: 'fell down', w: .8 },
+      { p: 'school', w: .7 }, { p: 'children', w: .6 }, { p: 'zebra crossing', w: .8 }, { p: 'no signal', w: .6 }, { p: 'dead animal', w: .9 },
+      { p: 'stray cattle', w: .8 }, { p: 'unsafe', w: .9 }, { p: 'ஆபத்து', w: 1 }, { p: 'விபத்து', w: 1 }, { p: 'பாதுகாப்பு', w: .8 }
+    ]
+  };
+  /** Intensity words that push severity up, with their weight. */
+  const INTENSITY = [
+    { p: 'accident', w: 1.0 }, { p: 'live wire', w: 1.0 }, { p: 'electric shock', w: 1.0 }, { p: 'death', w: 1.0 },
+    { p: 'deep', w: .8 }, { p: 'huge', w: .7 }, { p: 'severe', w: .8 }, { p: 'overflowing', w: .8 }, { p: 'urgent', w: .9 },
+    { p: 'emergency', w: .9 }, { p: 'immediately', w: .9 }, { p: 'dangerous', w: .9 }, { p: 'hospital', w: .6 }, { p: 'school', w: .6 },
+    { p: 'children', w: .6 }, { p: 'elderly', w: .6 }, { p: 'whole street', w: .5 }, { p: 'many days', w: .6 }, { p: 'one week', w: .6 },
+    { p: 'many families', w: .6 }, { p: 'cannot', w: .4 }, { p: 'blocked', w: .5 }, { p: 'sparks', w: .9 }, { p: 'two feet', w: .8 },
+    { p: 'flood', w: .8 }, { p: 'swallow', w: .9 }, { p: 'ஆபத்து', w: .9 }, { p: 'விபத்து', w: .9 }, { p: 'மிக மோசம்', w: .8 }
+  ];
+  /** Sentiment lexicon (positive/negative) for sentimentScore(). */
+  const POS = ['thanks', 'thank you', 'good', 'great', 'appreciate', 'helpful', 'resolved', 'happy', 'excellent', 'prompt', 'நன்றி', 'நல்ல'];
+  const NEG = ['dirty', 'bad', 'terrible', 'unbearable', 'hazard', 'dangerous', 'suffering', 'sick', 'fever', 'unhygienic', 'risk',
+    'problem', 'trouble', 'worst', 'poor', 'disgusting', 'unsafe', 'dead', 'injury', 'accident', 'worried', 'afraid', 'urgent',
+    'மோசம்', 'பிரச்சனை', 'ஆபத்து', 'கஷ்டம்', 'நோய்', 'அசுத்தம்'];
+  const URGENT = ['urgent', 'immediately', 'emergency', 'asap', 'since days', 'three days', 'four days', 'no water', 'live wire',
+    'accident', 'children', 'hospital', 'school', 'உடனே', 'ஆபத்து', 'குழந்தை'];
+  /** A deliberately small profanity list for the moderation demo (kept mild). */
+  const PROFANITY = ['idiot', 'stupid', 'damn', 'hell', 'fool', 'nonsense', 'bloody', 'முட்டாள்', 'முட்டாள்தனம்'];
+
+  const norm = (s) => ' ' + String(s || '').toLowerCase().replace(/\s+/g, ' ').trim() + ' ';
+
+  /* ---------- 4.2 classifyCategory(text, imageMeta) ---------- */
+  /** Weighted phrase scoring over English + Tamil dictionaries → {category, confidence, department, scores}. */
+  function classifyCategory(text, imageMeta) {
+    const hay = norm(text);
+    const words = hay.split(' ').filter(Boolean);
+    const scores = {};
+    CATEGORIES.forEach((c) => { scores[c.id] = 0; });
+    Object.keys(KEYWORDS).forEach((catId) => {
+      KEYWORDS[catId].forEach(({ p, w }) => {
+        // phrase match: contiguous words OR (for single words) a prefix/stem match
+        if (p.includes(' ')) { if (hay.includes(' ' + p + ' ')) scores[catId] += w * 1.6; return; }
+        if (hay.includes(' ' + p + ' ')) { scores[catId] += w * 1.25; return; }
+        const stem = p.length > 5 ? p.slice(0, p.length - 2) : p;
+        if (words.some((word) => word.startsWith(stem) && word.length >= stem.length)) scores[catId] += w;
+      });
+    });
+    // Image metadata nudge (e.g. a very dark frame leans streetlight, a road-heavy caption leans road damage).
+    if (imageMeta && imageMeta.count) {
+      const boost = Math.min(0.4, imageMeta.count * 0.12);
+      const hint = String(imageMeta.hint || '');
+      if (/road|pothole|street/i.test(hint)) scores['road damage'] += boost;
+      if (/night|dark/i.test(hint)) scores.streetlight += boost;
+    }
+    const ranked = Object.entries(scores).sort((a, b) => b[1] - a[1]);
+    const [bestCat, best] = ranked[0];
+    const second = ranked[1] ? ranked[1][1] : 0;
+    const total = ranked.reduce((s, r) => s + r[1], 0) || 1;
+    const confidence = best === 0 ? 0 : Utils.clamp(Utils.round((best / total) * 0.7 + (best / (best + second + 0.001)) * 0.3, 2), 0, 0.99);
+    const category = best === 0 ? null : bestCat;
+    return {
+      category, confidence: category ? confidence : 0,
+      department: category ? Store.categoryMeta(category).dept : null,
+      scores,
+      model: 'keyword-tf-v1 (swap → POST /v1/classify)'
+    };
+  }
+
+  /* ---------- 4.3 estimateSeverity(text, category, locationContext) ---------- */
+  function estimateSeverity(text, category, locationContext) {
+    const hay = norm(text);
+    let score = 1.6;                                   // baseline
+    const hits = [];
+    INTENSITY.forEach(({ p, w }) => { if (hay.includes(p)) { score += w * 1.5; hits.push(p); } });
+    if (category === 'public safety') score += 1.0;    // category floor
+    if (category === 'water' && /no water|contaminated/.test(hay)) score += 0.8;
+    if (/\b(school|college|hospital|bus stop|market)\b/.test(hay)) score += 0.5;
+    if (locationContext) {
+      const poi = nearestPoi(locationContext, 200);
+      if (poi) { score += 0.7 * (POI_WEIGHT[poi.type] || 0.5); hits.push('near ' + poi.name); }
+    }
+    const town = Utils.tokenize(text || '').length;
+    if (town < 6) score -= 0.4;                        // terse reports are usually less detailed
+    const severity = Utils.clamp(Math.round(score), 1, 5);
+    return { severity, signals: hits.slice(0, 5), model: 'rules-v1 (swap → POST /v1/severity)' };
+  }
+  function nearestPoi(loc, maxM = 200) {
+    if (!loc) return null;
+    let best = null, bestD = Infinity;
+    POIS.forEach((p) => { const d = Utils.haversine(loc, p); if (d <= maxM && d < bestD) { bestD = d; best = Object.assign({ distance: d }, p); } });
+    return best;
+  }
+
+  /* ---------- 4.4 sentimentScore(text) ---------- */
+  function sentimentScore(text) {
+    const hay = norm(text);
+    let score = 0, pos = 0, neg = 0, urgentHits = [];
+    POS.forEach((w) => { if (hay.includes(w)) { pos++; score += 0.35; } });
+    NEG.forEach((w) => { if (hay.includes(w)) { neg++; score -= 0.4; } });
+    URGENT.forEach((w) => { if (hay.includes(w)) { urgentHits.push(w); score -= 0.25; } });
+    const exclaims = (String(text).match(/!/g) || []).length;
+    if (exclaims >= 2) score -= 0.2;
+    if (/[A-Z]{5,}/.test(String(text))) score -= 0.1;   // shouting
+    score = Utils.clamp(score / 2.4, -1, 1);
+    return {
+      score: Utils.round(score, 2), positive: pos, negative: neg,
+      urgent: urgentHits.length > 0 || score <= -0.45,
+      urgentSignals: urgentHits.slice(0, 4),
+      model: 'lexicon-v1 (swap → POST /v1/sentiment)'
+    };
+  }
+
+  /* ---------- 4.5 moderate(text) ---------- */
+  function moderate(text) {
+    const reasons = [];
+    const raw = String(text || '');
+    const tokens = Utils.tokenize(raw);
+    if (tokens.length < 3) reasons.push('too short to be actionable');
+    if (/(.)\1{5,}/.test(raw)) reasons.push('repeated character spam');
+    if (/(https?:\/\/|www\.)/i.test(raw)) reasons.push('contains an external link');
+    const links = (raw.match(/(https?:\/\/|www\.)/gi) || []).length;
+    const profanity = PROFANITY.filter((p) => norm(raw).includes(p));
+    if (profanity.length) reasons.push('possibly offensive language');
+    if (tokens.length > 14 && tokens.filter((w) => /^[^aeiou\s]{6,}$/.test(w)).length / tokens.length > 0.25) reasons.push('likely gibberish');
+    if (tokens.length > 20 && raw.replace(/[^A-Z]/g, '').length / Math.max(1, raw.replace(/[^A-Za-z]/g, '').length) > 0.72) reasons.push('excessive shouting');
+    const spamScore = Utils.clamp(reasons.length * 0.34 + (links > 1 ? 0.3 : 0) + (profanity.length ? 0.2 : 0), 0, 1);
+    return { flagged: reasons.length > 0, reasons, spamScore: Utils.round(spamScore, 2), model: 'moderation-v1 (swap → POST /v1/moderate)' };
+  }
+
+  /* ---------- 4.6 detectDuplicates — 0.45 text + 0.35 geo + 0.20 category ---------- */
+  const tokensOf = (text) => Utils.tokenize(text).filter((w) => !STOP.has(w) && !STOP_TA.has(w) && w.length > 1);
+  function tfidfVec(tokens, corpus) {
+    const df = {}; let N = 1;
+    corpus.forEach((toks) => { N++; new Set(toks).forEach((w) => { df[w] = (df[w] || 0) + 1; }); });
+    const tf = {}; tokens.forEach((w) => { tf[w] = (tf[w] || 0) + 1; });
+    const vec = {};
+    Object.keys(tf).forEach((w) => { const idf = Math.log((N + 1) / ((df[w] || 0) + 1)) + 1; vec[w] = (1 + Math.log(tf[w])) * idf; });
+    return vec;
+  }
+  function cosine(a, b) {
+    let dot = 0, na = 0, nb = 0;
+    for (const k in a) { na += a[k] * a[k]; if (b[k]) dot += a[k] * b[k]; }
+    for (const k in b) nb += b[k] * b[k];
+    return !na || !nb ? 0 : dot / Math.sqrt(na * nb);
+  }
+  /** Exponential geo decay: 1.0 at 0 m, ≈0.37 at 150 m, 0 beyond 150 m. */
+  const geoScore = (a, b) => { const d = Utils.haversine(a, b); return d > DUP_RADIUS_M ? 0 : Math.exp(-d / DUP_RADIUS_M); };
+
+  function detectDuplicates(newReport, existing) {
+    const corpus = existing.map((c) => tokensOf(c.title + ' ' + c.description));
+    const newTokens = tokensOf(newReport.title + ' ' + newReport.description);
+    const newVec = tfidfVec(newTokens, corpus);
+    const matches = existing
+      .filter((c) => !c.removed && !c.linkedTo)
+      .map((c) => {
+        const textScore = cosine(newVec, tfidfVec(tokensOf(c.title + ' ' + c.description), corpus));
+        const geo = geoScore(newReport.location, c.location);
+        const catMatch = c.category === newReport.category ? 1 : 0;
+        const score = 0.45 * textScore + 0.35 * geo + 0.20 * catMatch;
+        return {
+          complaint: c, score: Utils.round(score, 3),
+          parts: { text: Utils.round(textScore, 3), geo: Utils.round(geo, 3), category: catMatch },
+          distance: Utils.round(Utils.haversine(newReport.location, c.location)),
+          verdict: score >= DUP_THRESHOLD ? 'duplicate' : score >= RELATED_THRESHOLD ? 'related' : 'distinct'
+        };
+      })
+      .filter((m) => m.verdict !== 'distinct')
+      .sort((a, b) => b.score - a.score);
+    return { matches, candidate: matches[0] || null, model: 'tfidf+postgis-v1 (swap → POST /v1/duplicates)' };
+  }
+
+  /* ---------- 4.7 priorityScore — explainable 0-100 ---------- */
+  function priorityScore(c, state) {
+    const cat = Store.categoryMeta(c.category);
+    const supporters = (c.supporters || []).length;
+    const sentiment = typeof c.sentiment === 'number' ? c.sentiment : sentimentScore(c.description).score;
+    const poi = nearestPoi(c.location, 200);
+    const ageH = (Utils.now() - c.createdAt) / 36e5;
+    const parts = {
+      severity: Utils.round(30 * (c.severity || 3) / 5, 1),
+      supporters: Utils.round(20 * Math.min(1, Math.log10(1 + supporters) / 1.4), 1),
+      sentiment: Utils.round(15 * Utils.clamp((1 - sentiment) / 2 + (c.severity >= 4 ? 0.18 : 0), 0, 1), 1),
+      proximity: Utils.round(15 * (poi ? (POI_WEIGHT[poi.type] || 0.6) : 0), 1),
+      age: Utils.round(10 * Math.min(1, ageH / (cat.slaHours * 1.5)), 1),
+      category: Utils.round(10 * cat.weight, 1)
+    };
+    const score = Utils.clamp(Math.round(Object.values(parts).reduce((a, b) => a + b, 0)), 0, 100);
+    return {
+      score, parts,
+      labels: {
+        severity: t('detail.why') === 'detail.why' ? 'Severity (' + (c.severity || 3) + '/5)' : 'Severity',
+        supporters: supporters + ' supporters',
+        sentiment: 'Citizen sentiment ' + sentiment,
+        proximity: poi ? 'Near ' + poi.name + ' (' + Math.round(poi.distance) + ' m)' : 'No critical facility within 200 m',
+        age: 'Open for ' + Utils.round(ageH, 1) + ' h',
+        category: 'Category weight ' + cat.weight + ' (' + cat.id + ')'
+      },
+      model: 'weighted-sum-v1 (swap → POST /v1/priority)'
+    };
+  }
+
+  /* ---------- 4.8 summarizeForOfficials(list) — template extractive brief ---------- */
+  function summarizeForOfficials(list, scopeLabel) {
+    if (!list.length) return 'No complaints in the current selection. Adjust the filters to generate a briefing.';
+    const byCat = {}; list.forEach((c) => { byCat[c.category] = (byCat[c.category] || 0) + 1; });
+    const topCats = Object.entries(byCat).sort((a, b) => b[1] - a[1]).slice(0, 3);
+    const hot = Store.hotspots(300).slice(0, 3);
+    const late = Store.overdue(list);
+    const high = list.filter((c) => c.priorityScore >= 70);
+    const noProof = list.filter((c) => c.status === 'Resolved' && (!c.resolution || !c.resolution.afterPhoto));
+    const oldest = list.slice().sort((a, b) => a.createdAt - b.createdAt)[0];
+    const avgAge = Utils.round(list.reduce((s, c) => s + (Utils.now() - c.createdAt) / 36e5, 0) / list.length, 1);
+    const L = [];
+    L.push(`Action brief — ${scopeLabel || 'all departments'} · ${list.length} open complaints · average age ${avgAge} h`);
+    L.push(`Top issues: ${topCats.map(([c, n]) => `${n} × ${c}`).join(', ')}.`);
+    if (hot.length) L.push(`Hotspots: ${hot.map((h) => `${h.count} reports within 300 m of ${h.area} (avg priority ${Math.round(h.score)})`).join('; ')}.`);
+    L.push(`Priority: ${high.length} complaints score ≥ 70${high.length ? ` — highest ${high[0].id} (“${Utils.truncate(high.sort((a, b) => b.priorityScore - a.priorityScore)[0].title, 60)}”, ${high[0].priorityScore}/100)` : ''}.`);
+    L.push(`SLA: ${late.length} overdue${late.length ? ` (oldest breach ${late.sort((a, b) => a.slaDueAt - b.slaDueAt)[0].id}, ${Math.abs(Utils.hoursLeft(late[0].slaDueAt))} h late)` : ''}${noProof.length ? `; ${noProof.length} resolved without proof` : ''}.`);
+    L.push(`Recommended: dispatch field staff to the top hotspot first, clear the ${late.length} overdue tickets today, and publish before/after photos for the ${list.filter((c) => c.status === 'Resolved' || c.status === 'Closed').length} completed jobs.`);
+    if (oldest) L.push(`Reference: ${oldest.id} has been open ${Utils.round((Utils.now() - oldest.createdAt) / 36e5, 1)} h (filed ${Utils.fmtDate(oldest.createdAt)}).`);
+    return L.join('\n');
+  }
+
+  /* ---------- 4.9 Density grid for the pure-JS heatmap ---------- */
+  function heatBuckets(list, cell = 0.0022) {
+    const grid = new Map();
+    list.forEach((c) => {
+      const key = Math.round(c.location.lat / cell) + ':' + Math.round(c.location.lng / cell);
+      const b = grid.get(key) || { lat: 0, lng: 0, n: 0 };
+      b.lat += c.location.lat; b.lng += c.location.lng; b.n += 1;
+      grid.set(key, b);
+    });
+    const buckets = Array.from(grid.values()).map((b) => ({ lat: b.lat / b.n, lng: b.lng / b.n, n: b.n }));
+    const max = buckets.reduce((m, b) => Math.max(m, b.n), 1);
+    return buckets.map((b) => Object.assign(b, { intensity: b.n / max }));
+  }
+
+  /* ---------- 4.10 Full pipeline used by the report wizard ---------- */
+  function analyze(draft, state) {
+    const text = draft.title + '. ' + draft.description;
+    const classification = classifyCategory(text, { count: (draft.media || []).length, hint: draft.mediaHint || '' });
+    const category = draft.category || classification.category || 'road damage';
+    const severity = estimateSeverity(text, category, draft.location);
+    const sentiment = sentimentScore(text);
+    const moderation = moderate(text);
+    const skeleton = {
+      title: draft.title, description: draft.description, category,
+      location: draft.location, supporters: [], media: draft.media || [],
+      reporterId: Store.isGuest() ? 'guest' : Store.me().id, createdAt: Utils.now()
+    };
+    skeleton.severity = severity.severity; skeleton.sentiment = sentiment.score;
+    const duplicates = detectDuplicates(skeleton, state.complaints);
+    const priority = priorityScore(Object.assign({}, skeleton, {
+      slaDueAt: Utils.addHours(skeleton.createdAt, Store.categoryMeta(category).slaHours),
+      status: 'Submitted', linkedTo: null, duplicates: [], followers: [], comments: [], flags: []
+    }), state);
+    return { classification, category, severity, sentiment, moderation, duplicates, priority, department: Store.categoryMeta(category).dept };
+  }
+
+  return {
+    classifyCategory, estimateSeverity, sentimentScore, moderate, detectDuplicates,
+    priorityScore, summarizeForOfficials, heatBuckets, analyze, nearestPoi,
+    tfidfVec, cosine, tokensOf, KEYWORDS, INTENSITY, POS, NEG, URGENT, PROFANITY, STOP
+  };
+})();
+
+/* ==========================================================================
+ * 5. TOAST + MODAL + CONFIRM — UI primitives used by services and views
+ * ======================================================================== */
+const Toast = (() => {
+  let root = null;
+  const icons = { ok: '✓', err: '!', warn: '▲', info: 'i' };
+  function show(msg, kind = 'info', opts = {}) {
+    if (!root) root = Utils.$('#toastRoot');
+    if (!root) return;
+    const el = document.createElement('div');
+    el.className = 'toast ' + kind;
+    el.setAttribute('role', kind === 'err' ? 'alert' : 'status');
+    el.innerHTML = `<span class="t-ico" aria-hidden="true">${icons[kind] || 'i'}</span>
+      <div class="grow"><div style="font-weight:600">${Utils.escapeHtml(msg)}</div>
+      ${opts.detail ? `<div class="tiny muted">${Utils.escapeHtml(opts.detail)}</div>` : ''}</div>
+      <button class="btn btn-xs btn-ghost" aria-label="${t('nav.notifications')} — dismiss">✕</button>`;
+    const kill = () => { el.classList.add('out'); setTimeout(() => el.remove(), 300); };
+    el.querySelector('button').addEventListener('click', kill);
+    root.appendChild(el);
+    const life = opts.ms || (kind === 'err' ? 6200 : 4200);
+    setTimeout(kill, life);
+    return el;
+  }
+  const group = (msgs) => msgs.forEach((m) => show(m.msg, m.kind || 'info'));
+  return { show, group };
+})();
+
+const Modal = (() => {
+  let root, box, lastFocus = null, onEsc = null;
+  function ensure() { root = root || Utils.$('#modalRoot'); box = box || Utils.$('#modalBox'); }
+  function open({ title, subtitle, body, actions = [], wide = false, onMount }) {
+    ensure();
+    lastFocus = document.activeElement;
+    box.className = 'modal glass grad' + (wide ? ' wide' : '');
+    box.innerHTML = `
+      <div class="modal-head">
+        <div>
+          <h3 id="modalTitle" style="margin:0">${Utils.escapeHtml(title || '')}</h3>
+          ${subtitle ? `<p class="small muted" style="margin:4px 0 0">${Utils.escapeHtml(subtitle)}</p>` : ''}
+        </div>
+        <button class="icon-btn" id="modalClose" aria-label="Close dialog"><svg width="18" height="18" aria-hidden="true"><use href="#i-close"/></svg></button>
+      </div>
+      <div id="modalBody">${body || ''}</div>
+      ${actions.length ? `<div class="row" style="justify-content:flex-end;margin-top:16px">${actions.map((a) => `<button class="btn ${a.class || ''}" data-act="${a.id}" ${a.disabled ? 'disabled' : ''}>${Utils.escapeHtml(a.label)}</button>`).join('')}</div>` : ''}`;
+    root.classList.add('open');
+    document.body.style.overflow = 'hidden';
+    Utils.$('#modalClose').addEventListener('click', close);
+    actions.forEach((a) => { const btn = box.querySelector(`[data-act="${a.id}"]`); if (btn) btn.addEventListener('click', () => { const r = a.onClick && a.onClick(); if (r !== false) close(); }); });
+    root.addEventListener('click', (e) => { if (e.target === root) close(); });
+    onEsc = (e) => { if (e.key === 'Escape') close(); if (e.key === 'Tab') Utils.trapFocus(box, e); };
+    document.addEventListener('keydown', onEsc);
+    if (onMount) onMount(box);
+    const focusTarget = box.querySelector('[data-autofocus]') || box.querySelector('input,textarea,select,button');
+    if (focusTarget) setTimeout(() => focusTarget.focus(), 60);
+    return box;
+  }
+  function close() {
+    ensure();
+    root.classList.remove('open'); document.body.style.overflow = '';
+    if (onEsc) document.removeEventListener('keydown', onEsc);
+    onEsc = null;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+  /** Promise-based confirm dialog. */
+  function confirm(message, { title = 'Please confirm', ok = 'Confirm', cancel = 'Cancel', danger = false } = {}) {
+    return new Promise((resolve) => {
+      open({
+        title, body: `<p>${Utils.escapeHtml(message)}</p>`,
+        actions: [
+          { id: 'cancel', label: cancel, class: 'btn-ghost', onClick: () => resolve(false) },
+          { id: 'ok', label: ok, class: danger ? 'btn-coral' : 'btn-primary', onClick: () => resolve(true) }
+        ]
+      });
+    });
+  }
+  return { open, close, confirm };
+})();
+
+/* ==========================================================================
+ * 6. ACTIONS — every mutation goes through here (RBAC + state machine + audit)
+ * ======================================================================== */
+const Actions = (() => {
+  const deny = (reason) => {
+    if (reason === 'proofNeeded') Toast.show(t('toast.proofNeeded'), 'warn');
+    else if (reason === 'authNeeded') Toast.show(t('toast.authNeeded'), 'warn');
+    else Toast.show(t('toast.roleDenied'), 'err');
+    return false;
+  };
+  const who = () => (Store.me() ? Store.me().name : 'Guest');
+
+  function upvote(id) {
+    const c = Store.complaint(id); if (!c) return;
+    const chk = Store.can('upvote', c); if (!chk.ok) return deny(chk.reason);
+    const uid = Store.me().id;
+    const i = c.supporters.indexOf(uid);
+    if (i >= 0) { c.supporters.splice(i, 1); Toast.show(t('toast.removed'), 'info'); }
+    else {
+      c.supporters.push(uid);
+      Toast.show(t('toast.upvoted', { n: c.supporters.length }), 'ok');
+      if (c.supporters.length === 3) Store.notify({ title: '3 supporters on ' + c.id, body: c.title, complaintId: c.id, kind: 'support', audience: 'official', dept: c.department });
+    }
+    refreshPriority(c); Store.emit('complaint:update');
+    return i < 0;
+  }
+  function follow(id) {
+    const c = Store.complaint(id); if (!c) return;
+    const chk = Store.can('follow', c); if (!chk.ok) return deny(chk.reason);
+    const uid = Store.me().id; const i = c.followers.indexOf(uid);
+    if (i >= 0) { c.followers.splice(i, 1); Toast.show(t('toast.unfollowed', { id }), 'info'); }
+    else { c.followers.push(uid); Toast.show(t('toast.following', { id }), 'ok'); }
+    Store.emit('complaint:update');
+    return i < 0;
+  }
+  function comment(id, text, imageDataUrl) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('comment', c); if (!chk.ok) return deny(chk.reason);
+    const body = String(text || '').trim();
+    if (body.length < 2) { Toast.show(t('form.tooShort', { n: 2 }), 'warn'); return false; }
+    c.comments.push({ id: Utils.uid('cmt'), by: Store.me().id, name: who(), text: body, image: imageDataUrl || null, at: Utils.now() });
+    Toast.show(t('toast.comment'), 'ok');
+    Store.notify({ title: 'New comment on ' + id, body: Utils.truncate(body, 70), complaintId: id, kind: 'comment', audience: 'citizen', userId: c.reporterId });
+    Store.emit('complaint:update'); return true;
+  }
+  /** Central state-machine transition. Returns {ok, reason}. */
+  function transition(id, to, opts = {}) {
+    const c = Store.complaint(id);
+    if (!c) return { ok: false, reason: 'notFound' };
+    const allowed = TRANSITIONS[c.status] && TRANSITIONS[c.status][to];
+    if (!allowed) { Toast.show(t('toast.invalid', { id, from: t('status.' + c.status), to: t('status.' + to) }), 'err'); return { ok: false, reason: 'invalidTransition' }; }
+    const role = opts.by || Store.state.role;
+    // 'system' is the internal actor used by seeds/automation; everything else must be listed.
+    if (role !== 'system' && !allowed.roles.includes(role)) { return { ok: false, reason: 'roleDenied', blocked: true }; }
+    if (allowed.evidence && (!c.resolution || !c.resolution.afterPhoto || !c.resolution.note)) { Toast.show(t('toast.proofNeeded'), 'err'); return { ok: false, reason: 'proofNeeded' }; }
+    if (Store.state.role === 'official' && Store.myDept() && c.department !== Store.myDept()) return { ok: false, reason: 'roleDenied', blocked: true };
+    Store.logTransition(c, to, opts.actorId || (Store.me() ? Store.me().id : 'system'), opts.note || '');
+    if (to === 'Closed') { c.resolution.confirmed = true; }
+    if (to === 'Reopened') { c.resolution.confirmed = false; }
+    if (to === 'Resolved') Store.notify({ title: c.id + ' resolved — please confirm', body: c.title, complaintId: c.id, kind: 'resolve', audience: 'citizen', userId: c.reporterId });
+    else Store.notify({ title: c.id + ' → ' + t('status.' + to), body: c.title, complaintId: c.id, kind: 'status', audience: 'citizen', userId: c.reporterId });
+    Store.emit('complaint:update');
+    return { ok: true };
+  }
+  const verify = (id, note) => transition(id, 'Verified', { note: note || 'Verified on site' });
+  const startWork = (id, note) => transition(id, 'In Progress', { note: note || 'Field work started' });
+  function assign(id, staff, note) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('assign', c); if (!chk.ok) return deny(chk.reason);
+    c.assignedTo = staff;
+    const res = transition(id, 'Assigned', { note: (note || '') + ' → ' + staff });
+    if (res.ok) Toast.show(t('toast.assigned', { id, staff }), 'ok');
+    return res.ok;
+  }
+  /** Resolution requires proof — enforced here as well as in the UI. */
+  function resolve(id, { afterPhoto, note }) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('resolve', Object.assign({}, c, { resolution: { afterPhoto, note } }));
+    if (!chk.ok) return deny(chk.reason);
+    if (Store.state.role === 'official' && Store.myDept() && c.department !== Store.myDept()) return deny('roleDenied');
+    if (!afterPhoto || !String(note || '').trim()) { Toast.show(t('toast.proofNeeded'), 'err'); return false; }
+    c.resolution = { afterPhoto, note: String(note).trim(), at: Utils.now(), confirmed: null, rating: null };
+    const res = transition(id, 'Resolved', { note: 'Proof uploaded: ' + Utils.truncate(note, 60) });
+    if (res.ok) Toast.show(t('status.Resolved') + ' — ' + id, 'ok');
+    return res.ok;
+  }
+  function confirmFix(id) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('confirm', c); if (!chk.ok) return deny(chk.reason);
+    const res = transition(id, 'Closed', { note: 'Citizen confirmed the fix' });
+    if (res.ok) { Toast.show(t('toast.confirmed', { id }), 'ok'); Confetti.burst(0.5); }
+    return res.ok;
+  }
+  function rejectFix(id, reason) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('reject', c); if (!chk.ok) return deny(chk.reason);
+    const res = transition(id, 'Reopened', { note: reason || 'Citizen rejected the resolution' });
+    if (res.ok) Toast.show(t('toast.rejected'), 'warn');
+    return res.ok;
+  }
+  function rate(id, stars) {
+    const c = Store.complaint(id); if (!c || !c.resolution) return false;
+    const chk = Store.can('rate', c); if (!chk.ok) return deny(chk.reason);
+    c.resolution.rating = Utils.clamp(Math.round(stars), 1, 5);
+    Toast.show(t('toast.rated', { n: c.resolution.rating }), 'ok');
+    Store.emit('complaint:update'); return true;
+  }
+  function flag(id, reason) {
+    const c = Store.complaint(id); if (!c) return false;
+    const chk = Store.can('flag', c); if (!chk.ok) return deny(chk.reason);
+    c.flags.push({ by: Store.me() ? Store.me().id : 'guest', at: Utils.now(), reason: reason || 'Reported by a user', status: 'open' });
+    Toast.show(t('toast.flag'), 'warn');
+    Store.emit('complaint:update'); return true;
+  }
+  /* ---------- admin ---------- */
+  function reviewFlag(id, index, decision) {
+    const c = Store.complaint(id); if (!c) return;
+    const chk = Store.can('reviewFlags', c); if (!chk.ok) return deny(chk.reason);
+    const flag = c.flags[index]; if (!flag) return;
+    flag.status = decision === 'approve' ? 'dismissed' : 'actioned';
+    if (decision === 'remove') c.removed = true;
+    Store.notify({ title: c.id + ' flag ' + (decision === 'approve' ? 'dismissed' : 'actioned'), body: flag.reason, complaintId: c.id, kind: 'flag', audience: 'admin' });
+    Toast.show(decision === 'approve' ? t('toast.flagApprove') : t('toast.flagReject'), decision === 'approve' ? 'ok' : 'warn');
+    Store.emit('complaint:update');
+  }
+  function banReporter(userId) {
+    const u = Store.user(userId); if (!u) return;
+    const chk = Store.can('reviewFlags'); if (!chk.ok) return deny(chk.reason);
+    u.banned = true;
+    Toast.show(t('toast.banned'), 'err');
+    Store.emit('admin:update');
+  }
+  function setSla(catId, hours) {
+    const cat = CATEGORIES.find((c) => c.id === catId); if (!cat) return;
+    const chk = Store.can('manageSLA'); if (!chk.ok) return deny(chk.reason);
+    cat.slaHours = Utils.clamp(Number(hours) || cat.slaHours, 1, 720);
+    // Re-base every open ticket's SLA clock so the change is visible immediately.
+    Store.state.complaints.forEach((c) => {
+      if (c.category === catId && c.status !== 'Closed' && c.status !== 'Resolved') {
+        c.slaDueAt = Utils.addHours(c.createdAt, cat.slaHours);
+      }
+    });
+    Toast.show(t('toast.slaSaved'), 'ok');
+    Store.emit('admin:update');
+  }
+  function addDepartment(data) {
+    const chk = Store.can('manageDepts'); if (!chk.ok) return deny(chk.reason);
+    Store.state.departments.push(Object.assign({ id: Utils.uid('d') }, data));
+    Toast.show(data.name + ' added', 'ok');
+    Store.emit('admin:update');
+  }
+  /** Recompute derived AI fields after supporters/severity change. */
+  function refreshPriority(c) {
+    c.priority = Services.priorityScore(c, Store.state);
+    c.priorityScore = c.priority.score;
+  }
+  /* ---------- report submission (creates OR merges) ---------- */
+  function submitReport(draft, analysis, { supportExisting = false } = {}) {
+    const chk = Store.can('submit'); if (!chk.ok) return deny(chk.reason);
+    const cat = Store.categoryMeta(analysis.category);
+    const nowTs = Utils.now();
+    if (supportExisting && analysis.duplicates.candidate) {
+      const target = analysis.duplicates.candidate.complaint;
+      const uid = Store.me() ? Store.me().id : 'guest';
+      if (!target.supporters.includes(uid)) target.supporters.push(uid);
+      if (!target.followers.includes(uid)) target.followers.push(uid);
+      target.comments.push({ id: Utils.uid('cmt'), by: uid, name: who(), text: 'Supporting this report — I have seen the same issue. ' + Utils.truncate(draft.description, 90), image: (draft.media || [])[0] || null, at: nowTs });
+      refreshPriority(target);
+      Store.notify({ title: 'Duplicate converted to support', body: target.id + ' now has ' + target.supporters.length + ' supporters', complaintId: target.id, kind: 'merge', audience: 'official', dept: target.department });
+      Toast.show(t('form.merged', { id: target.id }), 'ok');
+      Store.emit('complaint:update');
+      return { merged: true, complaint: target };
+    }
+    const base = {
+      id: 'CC-' + (Store.state.complaints.reduce((mx, x) => Math.max(mx, Number(String(x.id).replace(/\D/g, '')) || 0), 1045) + 1),
+      title: String(draft.title).trim(), description: String(draft.description).trim(),
+      category: analysis.category, severity: analysis.severity.severity, priorityScore: 0,
+      department: cat.dept, status: 'Submitted',
+      location: { lat: draft.location.lat, lng: draft.location.lng, address: draft.location.address || 'Pinned on map' },
+      media: draft.media || [], reporterId: Store.me() ? Store.me().id : 'guest', anonymous: !!draft.anonymous,
+      supporters: [], followers: [], linkedTo: null, duplicates: [], comments: [],
+      statusHistory: [{ status: 'Submitted', by: Store.me() ? Store.me().id : 'guest', at: nowTs, note: 'Report submitted' }],
+      resolution: { afterPhoto: null, note: '', at: null, confirmed: null, rating: null },
+      flags: [], sentiment: analysis.sentiment.score, moderation: analysis.moderation,
+      createdAt: nowTs, slaDueAt: Utils.addHours(nowTs, cat.slaHours)
+    };
+    base.priority = Services.priorityScore(base, Store.state);
+    base.priorityScore = base.priority.score;
+    // Auto-flag if moderation or duplicate-detection says the report looks suspicious.
+    if (analysis.moderation.flagged) base.flags.push({ by: 'system', at: nowTs, reason: analysis.moderation.reasons.join('; '), status: 'open' });
+    if (analysis.duplicates.candidate && analysis.duplicates.candidate.verdict === 'duplicate' && supportExisting === false && draft.forceDuplicate !== true && (Store.state.role === 'admin')) {
+      // admins bypass; citizens are always offered the merge above
+    }
+    Store.addComplaint(base);
+    if (Store.me()) Store.notify({ title: 'Ticket ' + base.id + ' created', body: Utils.truncate(base.title, 60), complaintId: base.id, kind: 'status', audience: 'citizen', userId: Store.me().id });
+    Toast.show(t('form.ok', { id: base.id, dept: base.department, score: base.priorityScore, band: t('pri.' + Store.bandFor(base.priorityScore).key) }), 'ok');
+    return { merged: false, complaint: base };
+  }
+  /** Demo/demo-mode helper: move a ticket forward one step as the department. */
+  function advanceAsDepartment(id) {
+    const c = Store.complaint(id); if (!c) return false;
+    const savedRole = Store.state.role, savedUser = Store.state.userId;
+    Store.state.role = 'official';
+    const official = Store.state.users.find((u) => u.role === 'official' && u.department === c.department);
+    if (official) Store.state.userId = official.id;
+    let ok = false;
+    if (c.status === 'Submitted') ok = transition(id, 'Verified', { note: 'Verified by ward staff on site' }).ok;
+    else if (c.status === 'Verified') { c.assignedTo = (STAFF[c.department] || ['Field crew'])[0]; ok = transition(id, 'Assigned', { note: 'Assigned to ' + c.assignedTo }).ok; }
+    else if (c.status === 'Assigned' || c.status === 'Reopened') ok = transition(id, 'In Progress', { note: 'Material moved to site, work started' }).ok;
+    Store.state.role = savedRole; Store.state.userId = savedUser;
+    if (ok) {
+      // Re-check with the real user context; demo pauses between steps anyway.
+      Store.emit('complaint:update');
+    }
+    return ok;
+  }
+  return { upvote, follow, comment, transition, verify, startWork, assign, resolve, confirmFix, rejectFix, rate, flag,
+    reviewFlag, banReporter, setSla, addDepartment, refreshPriority, submitReport, advanceAsDepartment };
+})();

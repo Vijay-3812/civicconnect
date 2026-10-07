@@ -1,0 +1,299 @@
+/* ==========================================================================
+ * 8. COMPONENTS — small pure view helpers shared by every page
+ * ======================================================================== */
+const Components = (() => {
+  const statusChip = (c) => `<span class="chip bg-${Store.statusColorKey(c)} st-${Store.statusColorKey(c)}"><span class="dot" aria-hidden="true"></span>${t('status.' + c.status)}</span>`;
+  const categoryChip = (catId) => {
+    const m = Store.categoryMeta(catId);
+    return `<span class="chip"><svg width="14" height="14" aria-hidden="true"><use href="#${m.icon}"/></svg>${t('cat.' + catId)}</span>`;
+  };
+  const sevDots = (n) => `<span class="sev-dots" role="img" aria-label="severity ${n} of 5">${[1, 2, 3, 4, 5].map((i) => `<i class="${i <= n ? 'on' : ''}"></i>`).join('')}</span>`;
+  const priorityRing = (score, color) => `<div class="pri-ring" style="--p:${score};--ring:${color}" role="img" aria-label="priority score ${score} of 100"><span>${score}</span></div>`;
+  const avatar = (u) => `<span class="avatar" style="background:${Utils.colorFor(u ? u.name : 'anon')}" title="${Utils.escapeHtml(u ? u.name : 'Anonymous')}">${Utils.escapeHtml(Utils.initials(u ? u.name : 'A N'))}</span>`;
+  const avatarStack = (ids, max = 4) => {
+    const list = (ids || []).map((id) => Store.user(id)).filter(Boolean);
+    if (!list.length) return `<span class="tiny muted">${t('detail.supporters')}: 0</span>`;
+    const shown = list.slice(0, max), more = list.length - shown.length;
+    return `<div class="avatar-stack">${shown.map(avatar).join('')}${more > 0 ? `<span class="avatar" style="background:var(--glass-2);color:var(--text)">+${more}</span>` : ''}</div>`;
+  };
+  const overdueBadge = (c) => {
+    if (c.status === 'Closed' || c.status === 'Resolved') return '';
+    const late = Utils.now() > c.slaDueAt;
+    if (late) return `<span class="badge overdue"><span class="pulse" aria-hidden="true"></span>${t('detail.overdue')} ${Math.abs(Utils.hoursLeft(c.slaDueAt))}h</span>`;
+    return `<span class="badge">${t('detail.slaLeft', { h: Utils.hoursLeft(c.slaDueAt) })}</span>`;
+  };
+  const upvoteBtn = (c, compact = false) => {
+    const on = Store.me() && c.supporters.includes(Store.me().id);
+    return `<button class="upvote ${on ? 'on' : ''}" data-upvote="${c.id}" aria-pressed="${on}" aria-label="${t('detail.upvote')} ${c.id}, ${c.supporters.length} supporters">
+      <svg width="14" height="14" aria-hidden="true"><use href="#i-up"/></svg>${c.supporters.length}${compact ? '' : ' ' + t('detail.supporters')}</button>`;
+  };
+  const thumb = (c, cls = 'thumb') => (Store.state.prefs.lowbw || !c.media || !c.media[0])
+    ? `<div class="${cls}" style="display:grid;place-items:center;background:linear-gradient(135deg,rgba(124,58,237,.25),rgba(34,211,238,.18))"><svg width="26" height="26" aria-hidden="true"><use href="#${Store.categoryMeta(c.category).icon}"/></svg></div>`
+    : `<img class="${cls}" src="${c.media[0]}" alt="${Utils.escapeHtml(c.title)}" loading="lazy" />`;
+
+  /** Standard complaint card used in feeds, drawers and dashboards. */
+  function complaintCard(c, opts = {}) {
+    const hasMedia = !Store.state.prefs.lowbw && c.media && c.media.length && opts.media !== false;
+    return `<article class="c-card ${hasMedia ? '' : 'no-media'}" data-open="${c.id}" tabindex="0" role="button" aria-label="${Utils.escapeHtml(c.title)}">
+      ${hasMedia ? thumb(c) : ''}
+      <div>
+        <div class="c-meta mb8">
+          ${statusChip(c)}
+          ${categoryChip(c.category)}
+          ${opts.hideSev ? '' : sevDots(c.severity)}
+          ${c.linkedTo ? `<span class="chip bg-dup st-dup"><svg width="12" height="12" aria-hidden="true"><use href="#i-link"/></svg>${t('detail.duplicateOf')} ${c.linkedTo}</span>` : ''}
+          ${(c.flags || []).some((f) => f.status === 'open') && Store.isStaff() ? `<span class="chip bg-high st-high">${t('detail.flagged')}</span>` : ''}
+        </div>
+        <h3 class="c-title">${Utils.escapeHtml(c.title)}</h3>
+        <p class="c-desc">${Utils.escapeHtml(c.description)}</p>
+        <div class="row" style="margin-top:10px;justify-content:space-between">
+          <div class="row" style="gap:10px">
+            ${upvoteBtn(c, true)}
+            ${avatarStack(c.supporters, 3)}
+            <span class="tiny muted">${Utils.ago(c.createdAt, Store.state.lang)} · ${Utils.escapeHtml(c.location.address)}</span>
+            ${opts.showSla === false ? '' : overdueBadge(c)}
+          </div>
+          <span class="tiny muted nowrap" title="${t('detail.why')}">${t('detail.why')} · <strong class="st-${Store.statusColorKey(c)}">${c.priorityScore}</strong>/100</span>
+        </div>
+      </div>
+    </article>`;
+  }
+  /** Compact row for the low-bandwidth / table modes. */
+  function complaintRow(c) {
+    return `<tr data-open="${c.id}" tabindex="0">
+      <td><strong>${c.id}</strong><div class="tiny muted">${Utils.escapeHtml(Utils.truncate(c.title, 46))}</div></td>
+      <td>${t('cat.' + c.category)}</td>
+      <td>${statusChip(c)}</td>
+      <td>${sevDots(c.severity)}</td>
+      <td class="num">${c.priorityScore}</td>
+      <td class="num">${c.supporters.length}</td>
+      <td>${Utils.ago(c.createdAt, Store.state.lang)}</td>
+      <td>${overdueBadge(c)}</td>
+    </tr>`;
+  }
+  /** Status timeline with a travelling glow on the connector. */
+  function timeline(c) {
+    const order = ['Submitted', 'Verified', 'Assigned', 'In Progress', 'Resolved', 'Closed'];
+    const reached = c.statusHistory.map((h) => h.status);
+    const idx = Math.max(0, order.findIndex((s) => s === c.status));
+    return `<div class="timeline">
+      <div class="tfill" style="height:${Math.round((idx / (order.length - 1)) * 92)}%"></div>
+      ${c.statusHistory.slice().reverse().map((h) => `
+        <div class="tl-item done ${h.status === c.status ? 'current' : ''}">
+          <div style="font-weight:700">${t('status.' + h.status)}</div>
+          <div class="tiny muted">${Utils.fmtDate(h.at, Store.state.lang)} · ${Utils.escapeHtml((Store.user(h.by) || { name: h.by === 'system' ? 'System' : 'Anonymous' }).name)}</div>
+          ${h.note ? `<div class="small" style="margin-top:3px">${Utils.escapeHtml(h.note)}</div>` : ''}
+        </div>`).join('')}
+      ${c.status === 'Reopened' ? `<div class="tl-item current"><div style="font-weight:700 st-pending">${t('status.Reopened')}</div><div class="tiny muted">Awaiting re-assignment</div></div>` : ''}
+    </div>`;
+  }
+  const empty = (title, msg, action = '') => `<div class="empty"><div class="eico" aria-hidden="true"><svg width="26" height="26"><use href="#i-search"/></svg></div>
+    <h3>${Utils.escapeHtml(title)}</h3><p class="muted small">${Utils.escapeHtml(msg)}</p>${action}</div>`;
+  const skeletonCards = (n = 3) => Array.from({ length: n }, () => `<div class="skel-card"><div class="skel skel-line" style="width:40%"></div><div class="skel skel-line" style="width:85%"></div><div class="skel skel-line" style="width:60%"></div></div>`).join('');
+  /** Explainability popover content. */
+  function whyPriority(c) {
+    const parts = (c.priority && c.priority.parts) || Services.priorityScore(c, Store.state).parts;
+    const labels = (c.priority && c.priority.labels) || Services.priorityScore(c, Store.state).labels;
+    const max = { severity: 30, supporters: 20, sentiment: 15, proximity: 15, age: 10, category: 10 };
+    const rows = Object.keys(parts).map((k) => `
+      <div class="flow-row">
+        <span title="${Utils.escapeHtml(labels[k] || k)}">${Utils.escapeHtml((labels[k] || k).split('(')[0].trim())}</span>
+        <span class="bar"><i style="width:${(parts[k] / max[k]) * 100}%"></i></span>
+        <span class="mono">${parts[k]}</span>
+      </div>`).join('');
+    return `<p class="small muted">${Utils.escapeHtml(labels.proximity)} · ${Utils.escapeHtml(labels.age)}</p>${rows}
+      <div class="row" style="justify-content:space-between;margin-top:10px">
+        <strong>Total</strong><strong class="st-${Store.statusColorKey(c)}">${c.priorityScore}/100 — ${t('pri.' + Store.bandFor(c.priorityScore).key)}</strong>
+      </div>
+      <p class="tiny muted" style="margin-top:10px">${Utils.escapeHtml((c.priority && c.priority.model) || 'weighted-sum-v1')}</p>`;
+  }
+  /** KPI card with count-up + sparkline. */
+  const kpi = (label, value, { suffix = '', dec = 0, spark = null, color = 'var(--aqua)', sub = '' } = {}) => `
+    <div class="kpi glass reveal">
+      <div class="lab">${Utils.escapeHtml(label)}</div>
+      <div class="val"><span data-count="${value}" data-dec="${dec}" data-suffix="${suffix}">0</span></div>
+      ${sub ? `<div class="tiny muted">${Utils.escapeHtml(sub)}</div>` : ''}
+      ${spark ? Motion.sparkline(spark, color) : ''}
+    </div>`;
+  const legend = () => `<div class="legend">
+      ${[['high', t('pri.high')], ['pending', t('pri.pending')], ['progress', t('pri.progress')], ['resolved', t('pri.resolved')], ['dup', t('pri.dup')]]
+        .map(([k, lbl]) => `<span class="row" style="gap:8px"><span class="legend-dot" style="background:${STATUS_COLOR[k]}"></span>${Utils.escapeHtml(lbl)}</span>`).join('')}
+    </div>`;
+  /** Progress-steps header used by the report wizard. */
+  const wizardSteps = (labels, current) => `<div class="wizard-steps" role="list" aria-label="${t('form.review')}">
+    ${labels.map((l, i) => `<span role="listitem" class="ws ${i < current ? 'done' : ''} ${i === current ? 'now' : ''}">${i < current ? '✓' : i + 1}. ${Utils.escapeHtml(l)}</span>`).join('')}
+  </div>`;
+  return { statusChip, categoryChip, sevDots, priorityRing, avatar, avatarStack, overdueBadge, upvoteBtn, thumb,
+    complaintCard, complaintRow, timeline, empty, skeletonCards, whyPriority, kpi, legend, wizardSteps };
+})();
+
+/* ==========================================================================
+ * 9. MAP VIEW — Leaflet + grid clustering + pure-JS density heatmap
+ *    Tiles come from OpenStreetMap; if they fail we keep a schematic grid so
+ *    every interaction still works.
+ * ======================================================================== */
+function createMapView(container, opts = {}) {
+  const shell = container.closest('.map-shell') || container;
+  let map = null, markerLayer = null, heatLayer = null, clusterLayer = null;
+  let visibleIds = new Set();
+  let tileErrors = 0, warnedTiles = false, aborted = false;
+  const CENTER = opts.center || [12.9210, 80.1250];
+
+  function init() {
+    if (typeof window.L === 'undefined') {
+      shell.classList.add('tiles-failed');
+      const fb = shell.querySelector('.map-fallback');
+      if (fb) fb.innerHTML = `<div class="center"><strong>Map library unavailable</strong><div class="small muted">Offline mode — ${Store.state.complaints.length} complaints are still listed in the panel and drawer.</div></div>`;
+      return null;
+    }
+    map = L.map(container, { zoomControl: false, attributionControl: true, preferCanvas: true, worldCopyJump: true }).setView(CENTER, opts.zoom || 13);
+    const tiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, minZoom: 10, crossOrigin: true,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors'
+    });
+    tiles.on('tileerror', () => {
+      tileErrors++;
+      if (tileErrors >= 3) {
+        shell.classList.add('tiles-failed');
+        if (!warnedTiles) { warnedTiles = true; Toast.show(t('err.offline'), 'warn'); }
+      }
+    });
+    tiles.on('tileload', () => { if (tileErrors < 3) shell.classList.remove('tiles-failed'); });
+    tiles.addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+    markerLayer = L.layerGroup().addTo(map);
+    heatLayer = L.layerGroup().addTo(map);
+    clusterLayer = L.layerGroup().addTo(map);
+    map.on('zoomend', () => sync());
+    // Click on empty map: quick "report here" jump (citizen convenience).
+    map.on('click', (e) => {
+      if (!opts.onMapClick) return;
+      opts.onMapClick(e.latlng);
+    });
+    setTimeout(() => map.invalidateSize(), 160);
+    return map;
+  }
+
+  /** Colour-coded div icon, with a pulsing radar ring for high priority. */
+  function icon(c, delay = 0) {
+    const key = Store.statusColorKey(c);
+    const color = STATUS_COLOR[key];
+    const hi = c.priorityScore >= 70 && key !== 'resolved' && key !== 'dup';
+    return L.divIcon({
+      className: '',
+      html: `<div class="mk-pin mk-drop ${hi ? 'pulse' : ''}" style="background:${color};color:${color};animation-delay:${delay}ms">
+        ${hi ? '<span class="radar" aria-hidden="true"></span>' : ''}
+        ${c.status === 'Resolved' || c.status === 'Closed' ? '<svg width="10" height="10" viewBox="0 0 24 24" style="position:absolute;left:1px;top:1px" aria-hidden="true"><path d="M4 12.5 9 18 20 6" fill="none" stroke="#06210f" stroke-width="3.4" stroke-linecap="round"/></svg>' : ''}
+      </div>`,
+      iconSize: [16, 16], iconAnchor: [8, 8], popupAnchor: [0, -10]
+    });
+  }
+  function popupHtml(c) {
+    const on = Store.me() && c.supporters.includes(Store.me().id);
+    const img = !Store.state.prefs.lowbw && c.media && c.media[0]
+      ? `<img class="pop-thumb" src="${c.media[0]}" alt="" />` : '';
+    return `<div style="min-width:230px">
+      ${img}
+      <div class="row" style="gap:6px;margin-bottom:4px">
+        <span class="chip bg-${Store.statusColorKey(c)} st-${Store.statusColorKey(c)}">${t('status.' + c.status)}</span>
+        <span class="chip">${c.priorityScore}/100</span>
+      </div>
+      <strong style="display:block;margin-bottom:4px">${Utils.escapeHtml(Utils.truncate(c.title, 62))}</strong>
+      <div class="tiny muted" style="margin-bottom:8px">${Utils.escapeHtml(c.location.address)} · ${Utils.ago(c.createdAt, Store.state.lang)}</div>
+      <div class="row" style="gap:8px">
+        <button class="upvote ${on ? 'on' : ''}" data-upvote="${c.id}" aria-pressed="${on}">
+          <svg width="13" height="13" aria-hidden="true"><use href="#i-up"/></svg>${c.supporters.length} ${t('detail.supporters')}
+        </button>
+        <button class="btn btn-xs btn-aqua" data-open="${c.id}">${t('action.open')}</button>
+      </div>
+    </div>`;
+  }
+  /** Grid grouping stands in for a clustering plugin: merge markers in the same cell when zoomed out. */
+  function buildClusters(list, zoom) {
+    const cell = zoom >= 15 ? 0 : zoom >= 14 ? 0.0025 : zoom >= 13 ? 0.005 : 0.01;
+    if (!cell) return { clusters: [], singles: list };
+    const grid = new Map();
+    list.forEach((c) => {
+      const k = Math.round(c.location.lat / cell) + ':' + Math.round(c.location.lng / cell);
+      const g = grid.get(k) || [];
+      g.push(c); grid.set(k, g);
+    });
+    const clusters = [], singles = [];
+    grid.forEach((g) => {
+      if (g.length < 2) { singles.push(g[0]); return; }
+      clusters.push(g);
+    });
+    return { clusters, singles };
+  }
+  function sync() {
+    if (!map || aborted) return;
+    const list = Store.mapComplaints().filter((c) => !c.linkedTo);
+    const heatOn = Store.state.filters.map.heat;
+    markerLayer.clearLayers(); clusterLayer.clearLayers(); heatLayer.clearLayers();
+    const { clusters, singles } = buildClusters(list, map.getZoom());
+    // Individual markers (bounce-staggered)
+    singles.forEach((c, i) => {
+      const m = L.marker([c.location.lat, c.location.lng], { icon: icon(c, Math.min(i * 28, 520)), title: c.title, riseOnHover: true, keyboard: true });
+      m.bindPopup(() => popupHtml(c), { maxWidth: 300, autoPan: true });
+      m.on('add', () => {
+        const el = m.getElement();
+        if (el) { el.setAttribute('tabindex', '0'); el.setAttribute('role', 'button'); el.setAttribute('aria-label', `${t('status.' + c.status)}: ${c.title}`); }
+      });
+      m.addTo(markerLayer);
+      c._marker = m;
+    });
+    clusters.forEach((g) => {
+      const lat = g.reduce((s, c) => s + c.location.lat, 0) / g.length;
+      const lng = g.reduce((s, c) => s + c.location.lng, 0) / g.length;
+      const worst = g.slice().sort((a, b) => b.priorityScore - a.priorityScore)[0];
+      const color = STATUS_COLOR[Store.statusColorKey(worst)];
+      L.circleMarker([lat, lng], { radius: Math.min(28, 12 + g.length * 1.6), color, weight: 2, fillColor: color, fillOpacity: 0.32 })
+        .bindTooltip(`${g.length} issues here — worst: ${Utils.truncate(worst.title, 40)}`, { direction: 'top' })
+        .on('click', () => map.flyTo([lat, lng], Math.min(17, map.getZoom() + 2), { duration: 0.6 }))
+        .addTo(clusterLayer);
+    });
+    // Density heatmap: grid buckets → translucent circles, opacity scaled by density
+    if (heatOn) {
+      Services.heatBuckets(list, 0.0022).forEach((b, i) => {
+        L.circle([b.lat, b.lng], {
+          radius: 140 + b.intensity * 320, stroke: false,
+          fillColor: b.intensity > 0.66 ? '#FF5C7A' : b.intensity > 0.33 ? '#FBBF24' : '#22D3EE',
+          fillOpacity: 0.10 + b.intensity * 0.4, className: 'hm-in', interactive: false
+        }).addTo(heatLayer);
+        if (b.n > 1) { /* bucket label kept out of the DOM to stay 60fps-safe */ }
+      });
+    }
+    visibleIds = new Set(list.map((c) => c.id));
+    if (opts.onSync) opts.onSync(list);
+  }
+  function flyTo(id) {
+    const c = Store.complaint(id); if (!map || !c) return;
+    map.flyTo([c.location.lat, c.location.lng], Math.max(16, map.getZoom()), { duration: 0.7 });
+    setTimeout(() => { if (c._marker && c._marker.openPopup) c._marker.openPopup(); }, 700);
+  }
+  function fitAll() {
+    if (!map) return;
+    const list = Store.mapComplaints();
+    if (!list.length) return;
+    map.fitBounds(L.latLngBounds(list.map((c) => [c.location.lat, c.location.lng])).pad(0.18), { animate: true });
+  }
+  function locate() {
+    return new Promise((resolve) => {
+      if (!navigator.geolocation) { Toast.show(t('map.denied'), 'warn'); resolve(null); return; }
+      Toast.show(t('form.gpsBusy'), 'info', { ms: 1600 });
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const center = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          Toast.show(t('map.located'), 'ok');
+          if (map) map.flyTo([center.lat, center.lng], 15, { duration: 0.8 });
+          resolve(center);
+        },
+        () => { Toast.show(t('map.denied'), 'warn'); resolve(null); },
+        { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 }
+      );
+    });
+  }
+  function destroy() { aborted = true; if (map) { try { map.remove(); } catch (e) { /* already gone */ } map = null; } }
+  const api = { init, sync, flyTo, fitAll, locate, destroy, get map() { return map; }, icon, popupHtml };
+  return api;
+}

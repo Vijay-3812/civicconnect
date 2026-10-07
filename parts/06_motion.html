@@ -1,0 +1,391 @@
+/* ==========================================================================
+ * 7. MOTION — GSAP orchestration with graceful degradation
+ *    Every animation is transform/opacity only, pauses when the tab is hidden,
+ *    and collapses to a fade when prefers-reduced-motion (or the a11y toggle) is on.
+ * ======================================================================== */
+const Motion = (() => {
+  const reduced = () => Store.state.prefs.reduce || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const hasGsap = () => typeof window.gsap !== 'undefined';
+  let stCtx = null;
+  let visible = !document.hidden;
+
+  document.addEventListener('visibilitychange', () => {
+    visible = !document.hidden;
+    if (hasGsap() && window.gsap.globalTimeline) { document.hidden ? window.gsap.globalTimeline.pause() : window.gsap.globalTimeline.resume(); }
+  });
+
+  /* ---------- 7.1 Intro: logo draw + counter + curtain ---------- */
+  function intro() {
+    const el = Utils.$('#intro'), counter = Utils.$('#introCount');
+    if (!el) { document.body.classList.add('ready'); return; }
+    if (reduced()) { el.classList.add('gone'); setTimeout(() => el.remove(), 500); document.body.classList.add('ready'); return; }
+    let n = 0;
+    const iv = setInterval(() => {
+      n = Math.min(100, n + Math.ceil(Math.random() * 13));
+      if (counter) counter.textContent = n + '%';
+      if (n >= 100) { clearInterval(iv); setTimeout(finish, 260); }
+    }, 90);
+    function finish() {
+      el.classList.add('gone');
+      document.body.classList.add('ready');
+      setTimeout(() => el.remove(), 900);
+      heroIn();
+    }
+  }
+  /* ---------- 7.2 Hero: split words, mesh parallax, magnetic CTAs ---------- */
+  function heroIn() {
+    const title = Utils.$('#heroTitle');
+    if (!title) return;
+    if (reduced() || !hasGsap()) { title.querySelectorAll('.word').forEach((w) => (w.style.opacity = 1)); return; }
+    const words = title.querySelectorAll('.word');
+    gsap.from(words, { yPercent: 118, opacity: 0, rotate: 4, duration: 0.95, ease: 'power4.out', stagger: 0.055 });
+    const heroCards = Utils.$$('#heroStats .kpi');
+    heroCards.forEach((el) => el.classList.add('in'));      // resolve .reveal before tweening
+    Utils.$('#heroStats .kpi:not(.in)') || null;
+    gsap.from([...document.querySelectorAll('#heroSub, #heroCtas .btn'), ...heroCards],
+      { y: 26, opacity: 0, duration: 0.7, ease: 'power3.out', stagger: 0.07, delay: 0.25, clearProps: 'opacity,transform' });
+    gsap.from('#heroVisual', { x: 40, opacity: 0, scale: 0.96, duration: 0.9, ease: 'power3.out', delay: 0.3 });
+  }
+  /** Split only TOP-LEVEL text nodes so nested tags (e.g. .grad-text) stay intact. */
+  function splitWords(el) {
+    if (!el || el.dataset.split) return el;
+    const nodes = Array.from(el.childNodes);
+    nodes.forEach((node) => {
+      if (node.nodeType !== 3) return;                 // skip element nodes, keep their markup
+      const frag = document.createDocumentFragment();
+      node.textContent.split(/(\s+)/).forEach((chunk) => {
+        if (!chunk.trim()) { frag.appendChild(document.createTextNode(chunk)); return; }
+        const span = document.createElement('span');
+        span.className = 'word';
+        span.textContent = chunk;
+        frag.appendChild(span);
+      });
+      node.parentNode.replaceChild(frag, node);
+    });
+    el.dataset.split = '1';
+    return el;
+  }
+  /** Mouse parallax tilt (throttled, transform only). */
+  function tilt(scope = document) {
+    if (reduced()) return;
+    Utils.$$('[data-tilt]', scope).forEach((el) => {
+      if (el.dataset.tiltBound) return;
+      el.dataset.tiltBound = '1';
+      const strength = Number(el.dataset.tilt) || 10;
+      const move = Utils.throttle((e) => {
+        const r = el.getBoundingClientRect();
+        const px = (e.clientX - r.left) / r.width - 0.5, py = (e.clientY - r.top) / r.height - 0.5;
+        el.style.transform = `perspective(1000px) rotateY(${px * strength}deg) rotateX(${-py * strength}deg) translateZ(0)`;
+        el.style.setProperty('--mx', (px + 0.5) * 100 + '%');
+        el.style.setProperty('--my', (py + 0.5) * 100 + '%');
+      }, 40);
+      el.addEventListener('mousemove', move);
+      el.addEventListener('mouseleave', () => { el.style.transform = ''; });
+    });
+  }
+  /** Magnetic buttons: translate slightly toward the cursor. */
+  function magnetic(scope = document) {
+    if (reduced() || window.matchMedia('(hover:none)').matches) return;
+    Utils.$$('[data-magnetic]', scope).forEach((el) => {
+      if (el.dataset.magBound) return; el.dataset.magBound = '1';
+      const move = Utils.throttle((e) => {
+        const r = el.getBoundingClientRect();
+        el.style.transform = `translate(${(e.clientX - (r.left + r.width / 2)) * 0.14}px, ${(e.clientY - (r.top + r.height / 2)) * 0.2}px)`;
+      }, 30);
+      el.addEventListener('mousemove', move);
+      el.addEventListener('mouseleave', () => { el.style.transform = ''; });
+    });
+  }
+  /* ---------- 7.3 Scroll reveals + scroll-linked step progress ---------- */
+  let io = null;
+  function reveals(root = document) {
+    const nodes = Utils.$$('.reveal:not(.in)', root);
+    if (!nodes.length) return;
+    if (reduced() || !('IntersectionObserver' in window)) { nodes.forEach((n) => n.classList.add('in')); return; }
+    if (!io) {
+      io = new IntersectionObserver((entries) => {
+        entries.forEach((en) => { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
+      }, { rootMargin: '0px 0px -8% 0px', threshold: 0.08 });
+    }
+    nodes.forEach((n, i) => { n.style.transitionDelay = Math.min(i * 55, 320) + 'ms'; io.observe(n); });
+  }
+  function scrollScenes(route) {
+    if (reduced() || !hasGsap() || !window.ScrollTrigger) return;
+    try {
+      if (stCtx) stCtx.revert();
+      stCtx = gsap.context(() => {
+        if (route === '#/' || route === '') {
+          // Pinned "how it works": the connector line draws while the steps light up.
+          const wrapEl = Utils.$('#howPin');
+          if (wrapEl) {
+            ScrollTrigger.create({
+              trigger: wrapEl, start: 'top 68%', end: 'bottom 40%', scrub: 0.6,
+              onUpdate: (self) => {
+                const fill = Utils.$('.steps-line i', wrapEl), steps = Utils.$$('.step', wrapEl);
+                if (fill) fill.style.height = Math.round(self.progress * 100) + '%';
+                const activeIdx = Math.min(steps.length - 1, Math.floor(self.progress * steps.length));
+                steps.forEach((s, i) => s.classList.toggle('active', i <= activeIdx));
+              },
+              onEnter: () => Utils.$$('#howPin .step').forEach((s) => s.classList.add('active'))
+            });
+          }
+          // Live stats strip
+          ScrollTrigger.create({ trigger: '#heroStats', start: 'top 85%', once: true, onEnter: () => countAll('#heroStats') });
+        }
+        if (route === '#/admin' || route === '#/stats') countAll(document);
+      });
+    } catch (e) { console.warn('ScrollTrigger scene skipped', e); }
+  }
+  /** Count-up numbers: <span data-count="123" data-suffix="%"> */
+  function countAll(root = document, dur = 900) {
+    Utils.$$('[data-count]', root).forEach((el) => {
+      if (el.dataset.counted === '1') return;
+      el.dataset.counted = '1';
+      const to = Number(el.dataset.count) || 0, dec = Number(el.dataset.dec || 0);
+      if (reduced()) { el.textContent = to.toFixed(dec) + (el.dataset.suffix || ''); return; }
+      const t0 = performance.now();
+      const tick = (t) => {
+        const p = Math.min(1, (t - t0) / dur);
+        const eased = 1 - Math.pow(1 - p, 3);
+        el.textContent = (to * eased).toFixed(dec) + (el.dataset.suffix || '');
+        if (p < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+  /* ---------- 7.4 Ripple + upvote particle burst ---------- */
+  function ripples() {
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('.btn, .chip-btn, .cat-card');
+      if (!btn || reduced()) return;
+      const r = btn.getBoundingClientRect();
+      const s = document.createElement('span');
+      s.className = 'rip';
+      const size = Math.max(r.width, r.height);
+      s.style.width = s.style.height = size + 'px';
+      s.style.left = (e.clientX - r.left - size / 2) + 'px';
+      s.style.top = (e.clientY - r.top - size / 2) + 'px';
+      btn.appendChild(s);
+      setTimeout(() => s.remove(), 620);
+    });
+  }
+  function upvoteBurst(x, y, colors = ['#7C3AED', '#22D3EE', '#A3E635', '#FF5C7A', '#FBBF24']) {
+    if (reduced()) return;
+    for (let i = 0; i < 14; i++) {
+      const p = document.createElement('i');
+      p.className = 'particle-i';
+      p.style.background = colors[i % colors.length];
+      p.style.left = x + 'px'; p.style.top = y + 'px';
+      document.body.appendChild(p);
+      const ang = (Math.PI * 2 * i) / 14 + Math.random();
+      const dist = 34 + Math.random() * 46;
+      p.animate([
+        { transform: 'translate(-50%,-50%) scale(1) rotate(0deg)', opacity: 1 },
+        { transform: `translate(${Math.cos(ang) * dist - 4}px, ${Math.sin(ang) * dist - 4}px) scale(.35) rotate(${Math.random() * 320}deg)`, opacity: 0 }
+      ], { duration: 620 + Math.random() * 320, easing: 'cubic-bezier(.22,1,.36,1)' }).onfinish = () => p.remove();
+    }
+  }
+  /* ---------- 7.5 FLIP: card → detail shared-element feel ---------- */
+  function flipFrom(sourceEl, routeFn) {
+    if (!sourceEl || reduced()) { routeFn(); return; }
+    const first = sourceEl.getBoundingClientRect();
+    const ghost = sourceEl.cloneNode(true);
+    ghost.className += ' fly-card glass';
+    Object.assign(ghost.style, { left: first.left + 'px', top: first.top + 'px', width: first.width + 'px', height: first.height + 'px', margin: 0, opacity: .96 });
+    document.body.appendChild(ghost);
+    routeFn();
+    requestAnimationFrame(() => {
+      const target = Utils.$('#detailHero') || Utils.$('#viewRoot');
+      const last = target ? target.getBoundingClientRect() : { left: 40, top: 90, width: window.innerWidth - 80, height: 320 };
+      ghost.animate([
+        { left: first.left + 'px', top: first.top + 'px', width: first.width + 'px', height: first.height + 'px', opacity: .96, borderRadius: '20px' },
+        { left: last.left + 'px', top: last.top + 'px', width: last.width + 'px', height: Math.min(last.height, 340) + 'px', opacity: 0, borderRadius: '26px' }
+      ], { duration: 460, easing: 'cubic-bezier(.22,1,.36,1)' }).onfinish = () => ghost.remove();
+      setTimeout(() => ghost.remove(), 600);
+    });
+  }
+  /** Duplicate merge: fly a mini card into the parent ticket. */
+  function flyInto(sourceEl, targetEl) {
+    if (!sourceEl || !targetEl || reduced()) return;
+    const a = sourceEl.getBoundingClientRect(), b = targetEl.getBoundingClientRect();
+    const ghost = document.createElement('div');
+    ghost.className = 'fly-card glass';
+    ghost.style.cssText = `left:${a.left}px;top:${a.top}px;width:${a.width}px;height:${a.height}px;border-radius:18px;display:grid;place-items:center;font-weight:700;color:var(--aqua)`;
+    ghost.textContent = 'Merging…';
+    document.body.appendChild(ghost);
+    ghost.animate([
+      { transform: 'translate(0,0) scale(1)', opacity: 1 },
+      { transform: `translate(${b.left - a.left + b.width / 2 - a.width / 2}px, ${b.top - a.top + 20}px) scale(.35)`, opacity: 0 }
+    ], { duration: 700, easing: 'cubic-bezier(.6,-0.05,.3,1)' }).onfinish = () => ghost.remove();
+  }
+  /* ---------- 7.6 Sparkline SVG for KPI cards ---------- */
+  function sparkline(values, color = 'var(--aqua)') {
+    if (!values || !values.length) return '';
+    const max = Math.max(...values, 1), w = 120, h = 34;
+    const step = w / Math.max(1, values.length - 1);
+    const pts = values.map((v, i) => [i * step, h - (v / max) * (h - 6) - 3]);
+    const d = pts.map((p, i) => (i ? `L${p[0].toFixed(1)},${p[1].toFixed(1)}` : `M${p[0].toFixed(1)},${p[1].toFixed(1)}`)).join(' ');
+    const area = `${d} L${w},${h} L0,${h} Z`;
+    return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true">
+      <path d="${area}" fill="${color}" opacity=".14"/>
+      <path d="${d}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"/>
+    </svg>`;
+  }
+  /* ---------- 7.7 Ambient: particles (capped, visibility-paused) + cursor glow ---------- */
+  function ambience() {
+    const glow = Utils.$('#cursorGlow');
+    if (glow && !reduced() && !window.matchMedia('(hover:none)').matches) {
+      const move = Utils.throttle((e) => { glow.style.left = e.clientX + 'px'; glow.style.top = e.clientY + 'px'; }, 46);
+      document.addEventListener('mousemove', move);
+    } else if (glow) glow.style.display = 'none';
+  }
+  /** Hero particle canvas — DPR-aware, pauses with the tab, capped at ~48 particles. */
+  function particles(canvasId = 'heroParticles') {
+    const cvs = document.getElementById(canvasId);
+    if (!cvs || reduced() || Store.state.prefs.lowbw) { if (cvs) cvs.style.display = 'none'; return () => {}; }
+    const ctx = cvs.getContext && cvs.getContext('2d');
+    // Defensive: a detached canvas (or no 2D context) simply disables the effect.
+    if (!ctx || !cvs.parentElement) { cvs.style.display = 'none'; return () => {}; }
+    let raf = null, t = 0, stopped = false;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    let W = 0, H = 0;
+    const parts = Array.from({ length: 44 }, () => ({ x: Math.random(), y: Math.random(), r: 0.6 + Math.random() * 2.1, s: 0.1 + Math.random() * 0.32, c: ['#7C3AED', '#22D3EE', '#FF5C7A', '#A3E635', '#FBBF24'][Math.floor(Math.random() * 5)] }));
+    function resize() {
+      const r = (cvs.parentElement || cvs).getBoundingClientRect();
+      W = cvs.width = Math.max(1, r.width * dpr); H = cvs.height = Math.max(1, r.height * dpr);
+      cvs.style.width = r.width + 'px'; cvs.style.height = r.height + 'px';
+    }
+    function frame() {
+      if (stopped) return;
+      if (!visible) { raf = requestAnimationFrame(frame); return; }
+      t += 0.006;
+      ctx.clearRect(0, 0, W, H);
+      parts.forEach((p, i) => {
+        const y = (p.y + Math.sin(t + i) * 0.02 - (t * p.s) % 1 + 1) % 1;
+        const x = (p.x + Math.cos(t * 1.2 + i) * 0.01 + 1) % 1;
+        ctx.globalAlpha = 0.18 + 0.32 * Math.sin(t * 2 + i) ** 2;
+        ctx.fillStyle = p.c;
+        ctx.beginPath(); ctx.arc(x * W, y * H, p.r * dpr, 0, Math.PI * 2); ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+      raf = requestAnimationFrame(frame);
+    }
+    resize(); window.addEventListener('resize', Utils.debounce(resize, 200));
+    if (!raf) frame();
+    return () => { stopped = true; cancelAnimationFrame(raf); window.removeEventListener('resize', resize); };
+  }
+  /* ---------- 7.8 Confetti (pure canvas, self-terminating) ---------- */
+  const Confetti = (() => {
+    const cvs = () => document.getElementById('confettiCanvas');
+    function burst(strength = 1, origin = { x: 0.5, y: 0.55 }) {
+      const canvas = cvs();
+      if (!canvas || reduced()) return;
+      const ctx = canvas.getContext('2d');
+      canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+      const colors = ['#7C3AED', '#22D3EE', '#A3E635', '#FF5C7A', '#FBBF24', '#FFFFFF'];
+      const N = Math.round(70 * strength);
+      const bits = Array.from({ length: N }, () => ({
+        x: canvas.width * origin.x + (Math.random() - 0.5) * 120,
+        y: canvas.height * origin.y + (Math.random() - 0.5) * 40,
+        vx: (Math.random() - 0.5) * 11 * strength,
+        vy: -Math.random() * 12 * strength - 3,
+        s: 4 + Math.random() * 7,
+        rot: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.35,
+        c: colors[Math.floor(Math.random() * colors.length)], life: 1
+      }));
+      let raf = null;
+      const start = performance.now();
+      function frame(now) {
+        const p = Math.min(1, (now - start) / 2100);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        bits.forEach((b) => {
+          b.vy += 0.36; b.x += b.vx; b.y += b.vy; b.rot += b.vr; b.life = 1 - p;
+          ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.rot);
+          ctx.globalAlpha = Math.max(0, b.life); ctx.fillStyle = b.c;
+          ctx.fillRect(-b.s / 2, -b.s / 2, b.s, b.s * 0.62); ctx.restore();
+        });
+        if (p < 1) raf = requestAnimationFrame(frame);
+        else ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(frame);
+    }
+    /** Confetti that originates from an element (used on "Confirm fixed"). */
+    function fromElement(el, strength = 1) {
+      if (!el) return burst(strength);
+      const r = el.getBoundingClientRect();
+      burst(strength, { x: (r.left + r.width / 2) / window.innerWidth, y: (r.top + r.height / 2) / window.innerHeight });
+    }
+    return { burst, fromElement };
+  })();
+  /* ---------- 7.9 Before/after comparison slider ---------- */
+  function comparison(root = document) {
+    Utils.$$('.cmp', root).forEach((el) => {
+      if (el.dataset.cmpBound) return; el.dataset.cmpBound = '1';
+      const handle = el.querySelector('.handle');
+      let dragging = false;
+      const set = (clientX) => {
+        const r = el.getBoundingClientRect();
+        const pct = Utils.clamp(((clientX - r.left) / r.width) * 100, 0, 100);
+        el.style.setProperty('--split', pct + '%');
+        if (handle) handle.setAttribute('aria-valuenow', Math.round(pct));
+      };
+      const down = (e) => { dragging = true; el.setPointerCapture && el.setPointerCapture(e.pointerId); set(e.clientX); };
+      const move = (e) => { if (dragging) set(e.clientX); };
+      const up = () => { dragging = false; };
+      el.addEventListener('pointerdown', down);
+      el.addEventListener('pointermove', move);
+      el.addEventListener('pointerup', up);
+      el.addEventListener('pointercancel', up);
+      el.addEventListener('pointerleave', up);
+      if (handle) {
+        handle.setAttribute('tabindex', '0');
+        handle.setAttribute('role', 'slider');
+        handle.setAttribute('aria-label', 'Before / after comparison');
+        handle.setAttribute('aria-valuemin', '0'); handle.setAttribute('aria-valuemax', '100'); handle.setAttribute('aria-valuenow', '50');
+        handle.addEventListener('keydown', (e) => {
+          const cur = parseFloat(el.style.getPropertyValue('--split')) || 50;
+          if (e.key === 'ArrowLeft') { el.style.setProperty('--split', Utils.clamp(cur - 4, 0, 100) + '%'); e.preventDefault(); }
+          if (e.key === 'ArrowRight') { el.style.setProperty('--split', Utils.clamp(cur + 4, 0, 100) + '%'); e.preventDefault(); }
+        });
+      }
+    });
+  }
+  /* ---------- 7.10 Scanning / analysing effect for AI results ---------- */
+  function scanChips(container, chips, gap = 220) {
+    if (!container) return;
+    container.innerHTML = '';
+    chips.forEach((c, i) => {
+      const el = document.createElement('span');
+      el.className = 'res-chip';
+      el.style.animationDelay = reduced() ? '0ms' : (i * gap) + 'ms';
+      el.innerHTML = c;
+      container.appendChild(el);
+      requestAnimationFrame(() => el.classList.add('in'));
+    });
+  }
+  /* ---------- 7.11 View enter animation helper ---------- */
+  function viewEnter(rootEl) {
+    if (!rootEl) return;
+    rootEl.classList.remove('view-out');
+    rootEl.classList.add('view-in');
+    setTimeout(() => rootEl.classList.remove('view-in'), 500);
+    if (hasGsap() && !reduced()) {
+      // Only animate blocks that are NOT scroll-revealed — otherwise the CSS resting
+      // opacity of .reveal (0) would become the tween's end value.
+      const targets = Array.from(rootEl.querySelectorAll('.card:not(.reveal), .c-card:not(.reveal), .kpi:not(.reveal), .kanban, .table-wrap, .step:not(.reveal)'));
+      if (targets.length) gsap.from(targets, { y: 18, opacity: 0, duration: .5, ease: 'power2.out', stagger: 0.03, clearProps: 'opacity,transform' });
+    }
+    reveals(rootEl); tilt(rootEl); magnetic(rootEl); comparison(rootEl); countAll(rootEl);
+  }
+  function init() {
+    ripples(); ambience();
+    if (!reduced() && hasGsap()) {
+      try { window.ScrollTrigger && gsap.registerPlugin(window.ScrollTrigger); } catch (e) { /* optional plugin */ }
+    }
+    intro();
+  }
+  return { init, intro, heroIn, splitWords, tilt, magnetic, reveals, scrollScenes, countAll, ripples, upvoteBurst,
+    flipFrom, flyInto, sparkline, ambience, particles, Confetti, comparison, scanChips, viewEnter, reduced, hasGsap };
+})();
+const Confetti = Motion.Confetti;

@@ -1,0 +1,970 @@
+/* ==========================================================================
+ * 13. CHART HELPER — Chart.js wrappers with theme awareness + cleanup
+ * ======================================================================== */
+const Charts = (() => {
+  const registry = [];
+  const available = () => typeof window.Chart !== 'undefined';
+  const css = (v, fallback) => { try { const x = getComputedStyle(document.documentElement).getPropertyValue(v).trim(); return x || fallback; } catch (e) { return fallback; } };
+  function destroyAll() { while (registry.length) { const c = registry.pop(); try { c.destroy(); } catch (e) { /* already gone */ } } }
+  function make(id, config) {
+    if (!available()) return null;
+    const el = document.getElementById(id);
+    if (!el) return null;
+    const theme = {
+      text: css('--text', '#EDF1FF'), muted: css('--muted', '#A2AFD2'), border: css('--border', 'rgba(255,255,255,.13)'),
+      grid: css('--border', 'rgba(255,255,255,.1)')
+    };
+    const base = {
+      responsive: true, maintainAspectRatio: false,
+      animation: Motion.reduced() ? false : { duration: 900, easing: 'easeOutQuart' },
+      plugins: {
+        legend: { labels: { color: theme.text, font: { family: 'Inter, sans-serif', size: 12 }, boxWidth: 12, usePointStyle: true } },
+        tooltip: { backgroundColor: css('--navy-2', '#121A38'), titleColor: theme.text, bodyColor: theme.muted, borderColor: theme.border, borderWidth: 1, padding: 10, cornerRadius: 10, displayColors: true }
+      },
+      scales: config.type === 'doughnut' || config.type === 'radar' || config.type === 'polarArea' ? undefined : {
+        x: { ticks: { color: theme.muted, font: { size: 11 } }, grid: { color: theme.grid, drawBorder: false } },
+        y: { ticks: { color: theme.muted, font: { size: 11 } }, grid: { color: theme.grid, drawBorder: false }, beginAtZero: true }
+      }
+    };
+    const chart = new Chart(el, Object.assign({}, config, { options: Object.assign(base, config.options || {}) }));
+    registry.push(chart);
+    return chart;
+  }
+  return { make, destroyAll, available };
+})();
+
+/* ==========================================================================
+ * 14. VIEW: LIVE MAP — floating filters, drawer list, heatmap, near-me
+ * ======================================================================== */
+const MapView = () => {
+  let mv = null;
+  const shellHtml = () => `
+    <div class="wrap section" style="max-width:100%">
+      <div class="between reveal" style="margin-bottom:12px">
+        <div><h2 style="margin-bottom:2px">${t('map.title')}</h2><p class="muted mb0 small">${t('map.sub')}</p></div>
+        <div class="row">
+          <button class="btn btn-sm" id="nearBtn"><svg width="15" height="15" aria-hidden="true"><use href="#i-target"/></svg>${t('map.near')}</button>
+          <button class="btn btn-sm" id="fitBtn"><svg width="15" height="15" aria-hidden="true"><use href="#i-grid"/></svg>${t('tab.all')}</button>
+          <a class="btn btn-sm btn-primary" href="#/report">${t('hero.cta1')}</a>
+        </div>
+      </div>
+      <div class="map-shell reveal" style="height:clamp(460px,72dvh,760px)">
+        <div id="map" style="height:100%"></div>
+        <div class="map-fallback" aria-hidden="true"><div class="center"><strong>${t('map.title')}</strong><div class="small muted">Schematic grid — OpenStreetMap tiles unavailable. Filters, cards and drawers still work.</div></div></div>
+        <section class="filter-panel glass" aria-label="${t('map.filterCat')}">
+          <div class="row between mb8">
+            <strong class="small">${t('map.filterCat')}</strong>
+            <button class="btn btn-xs btn-ghost" id="resetFilters">${t('map.reset')}</button>
+          </div>
+          <label class="sr" for="mapSearch">${t('map.search')}</label>
+          <input class="input" id="mapSearch" placeholder="${Utils.escapeHtml(t('map.search'))}" value="${Utils.escapeHtml(Store.state.filters.map.q)}" />
+          <div class="row" style="gap:6px;margin-top:10px">
+            ${CATEGORIES.map((c) => `<button class="chip chip-btn" data-cat="${c.id}" aria-pressed="${Store.state.filters.map.cats.includes(c.id)}">${t('cat.' + c.id)}</button>`).join('')}
+          </div>
+          <div class="row" style="gap:6px;margin-top:8px">
+            ${['high', 'pending', 'progress', 'resolved', 'dup'].map((k) => `<button class="chip chip-btn" data-status="${k}" aria-pressed="${Store.state.filters.map.statuses.includes(k)}"><span class="legend-dot" style="background:${STATUS_COLOR[k]}"></span>${t('pri.' + k)}</button>`).join('')}
+          </div>
+          <div class="row between" style="margin-top:12px">
+            <label class="switch"><input type="checkbox" id="heatToggle" ${Store.state.filters.map.heat ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('map.heat')}</span></label>
+            <button class="icon-btn" id="drawerBtn" aria-label="${t('map.drawer')}" aria-expanded="false"><svg width="18" height="18" aria-hidden="true"><use href="#i-layer"/></svg></button>
+          </div>
+          <hr class="hr" />
+          <strong class="small">${t('map.legend')}</strong>
+          <div style="margin-top:8px">${Components.legend()}</div>
+        </section>
+        <aside class="map-drawer glass" id="mapDrawer" aria-label="${t('map.drawer')}">
+          <div class="row between mb8">
+            <strong id="drawerCount">${t('map.count', { n: 0 })}</strong>
+            <button class="icon-btn" id="drawerClose" aria-label="Close list"><svg width="16" height="16" aria-hidden="true"><use href="#i-close"/></svg></button>
+          </div>
+          <div class="c-list" id="drawerList" style="gap:10px"></div>
+        </aside>
+      </div>
+      <p class="tiny muted" style="margin-top:10px">© OpenStreetMap contributors · ${t('map.sub')}</p>
+    </div>`;
+  function render(root) { root.innerHTML = shellHtml(); }
+  function bind(root) {
+    const el = Utils.$('#map');
+    mv = createMapView(el, { zoom: 13, onMapClick: (ll) => {
+      // Sensitive UX: a stray map click must never throw the user into a form.
+      const allowed = Store.can('submit');
+      if (!allowed.ok) { Toast.show(t(allowed.reason === 'authNeeded' ? 'toast.authNeeded' : 'toast.roleDenied'), 'warn'); return; }
+      const coord = ll.lat.toFixed(5) + ',' + ll.lng.toFixed(5);
+      L.popup({ closeButton: true, maxWidth: 260 })
+        .setLatLng(ll)
+        .setContent(`<div style="min-width:180px"><strong style="display:block;margin-bottom:6px">${t('map.reportHere')}</strong>
+          <button class="btn btn-xs btn-primary" data-report-here="${coord}">${t('map.openForm')}</button></div>`)
+        .openOn(mv.map);
+    } });
+    mv.init(); mv.sync(); update();
+    const refresh = () => { mv.sync(); update(); };
+    Utils.$$('[data-cat]', root).forEach((b) => b.addEventListener('click', () => {
+      const cats = Store.state.filters.map.cats, id = b.dataset.cat;
+      const i = cats.indexOf(id); i >= 0 ? cats.splice(i, 1) : cats.push(id);
+      b.setAttribute('aria-pressed', String(i < 0)); refresh();
+    }));
+    Utils.$$('[data-status]', root).forEach((b) => b.addEventListener('click', () => {
+      const st = Store.state.filters.map.statuses, key = b.dataset.status;
+      const i = st.indexOf(key); i >= 0 ? st.splice(i, 1) : st.push(key);
+      b.setAttribute('aria-pressed', String(i < 0)); refresh();
+    }));
+    const search = Utils.$('#mapSearch');
+    search.addEventListener('input', Utils.debounce(() => { Store.state.filters.map.q = search.value; refresh(); }, 240));
+    const heat = Utils.$('#heatToggle');
+    heat.addEventListener('change', () => { Store.state.filters.map.heat = heat.checked; mv.sync(); });
+    Utils.$('#resetFilters').addEventListener('click', () => {
+      Store.state.filters.map = { cats: [], statuses: [], heat: Store.state.filters.map.heat, q: '', near: false, listOnly: Store.state.filters.map.listOnly };
+      render(Utils.$('#viewRoot')); bind(Utils.$('#viewRoot')); Toast.show(t('map.reset'), 'info');
+    });
+    Utils.$('#nearBtn').addEventListener('click', async () => {
+      const center = await mv.locate();
+      if (!center) return;
+      Store.state.filters.map.center = center; Store.state.filters.map.near = true;
+      mv.sync(); update(); mv.fitAll();
+    });
+    Utils.$('#fitBtn').addEventListener('click', () => { Store.state.filters.map.near = false; mv.sync(); update(); mv.fitAll(); });
+    const drawer = Utils.$('#mapDrawer'), dBtn = Utils.$('#drawerBtn');
+    const toggle = (open) => { drawer.classList.toggle('open', open); dBtn.setAttribute('aria-expanded', String(open)); };
+    dBtn.addEventListener('click', () => toggle(!drawer.classList.contains('open')));
+    Utils.$('#drawerClose').addEventListener('click', () => toggle(false));
+  }
+  function update() {
+    const list = Store.mapComplaints().slice().sort((a, b) => b.priorityScore - a.priorityScore);
+    const host = Utils.$('#drawerList'); if (!host) return;
+    const count = Utils.$('#drawerCount'); if (count) count.textContent = t('map.count', { n: list.length });
+    if (Store.state.prefs.lowbw) {
+      // Low-bandwidth mode: a text-only table, no images and no card chrome.
+      host.innerHTML = list.length
+        ? `<div class="table-wrap"><table><caption class="sr">${t('map.drawer')}</caption>
+            <thead><tr><th scope="col">${t('form.fTitle')}</th><th scope="col">${t('form.fCat')}</th><th scope="col">${t('map.filterStatus')}</th><th scope="col">${t('off.filterSev')}</th><th scope="col">P</th><th scope="col">${t('detail.supporters')}</th><th scope="col">${t('off.age')}</th><th scope="col">SLA</th></tr></thead>
+            <tbody>${list.slice(0, 80).map((c) => Components.complaintRow(c)).join('')}</tbody></table></div>`
+        : Components.empty(t('empty.title'), t('map.empty'));
+      Utils.$$('tr[data-open]', host).forEach((tr) => tr.addEventListener('click', () => { if (mv) mv.flyTo(tr.dataset.open); }));
+      return;
+    }
+    host.innerHTML = list.length
+      ? list.slice(0, 40).map((c) => `<div data-marker-card="${c.id}">${Components.complaintCard(c, { media: false, showSla: false })}</div>`).join('')
+      : Components.empty(t('empty.title'), t('map.empty'));
+    Utils.$$('[data-marker-card]', host).forEach((row) => row.addEventListener('click', (e) => {
+      if (e.target.closest('[data-upvote]')) return;
+      const id = row.dataset.markerCard;
+      const drawer = Utils.$('#mapDrawer'); if (drawer && window.matchMedia('(max-width:999px)').matches) drawer.classList.remove('open');
+      if (mv) mv.flyTo(id);
+    }));
+  }
+  function mount() { bind(Utils.$('#viewRoot')); }
+  function destroy() { if (mv) { mv.destroy(); mv = null; } }
+  return { id: 'map', render, mount, update, destroy };
+};
+
+/* ==========================================================================
+ * 15. VIEW: COMPLAINT DETAIL — gallery, timeline, priority, proof, comments
+ * ======================================================================== */
+const DetailView = (id) => {
+  function render(root) {
+    while (detailMapRefs.length) { const m = detailMapRefs.pop(); try { m.remove(); } catch (e) { /* noop */ } }
+    const c = Store.complaint(id);
+    if (!c) { root.innerHTML = `<div class="wrap section">${Components.empty(t('detail.notFound'), t('err.generic'), '<a class="btn btn-primary" href="#/map">' + t('nav.map') + '</a>')}</div>`; return; }
+    const parent = c.linkedTo ? Store.complaint(c.linkedTo) : null;
+    const dupes = c.duplicates.map((d) => Store.complaint(d)).filter(Boolean);
+    const reporter = Store.user(c.reporterId);
+    const canConfirm = Store.can('confirm', c).ok && c.status === 'Resolved';
+    const canReject = Store.can('reject', c).ok && c.status === 'Resolved';
+    const isFollowing = Store.me() && c.followers.includes(Store.me().id);
+    const isSupporting = Store.me() && c.supporters.includes(Store.me().id);
+    const official = Store.role === 'official' && Store.myDept() === c.department;
+    const rows = ['Submitted', 'Verified', 'Assigned', 'In Progress', 'Resolved'];
+    root.innerHTML = `
+    <div class="wrap section" style="max-width:1100px">
+      <nav class="row small" aria-label="Breadcrumb" style="margin-bottom:10px">
+        <a href="#/map">${t('nav.map')}</a><span class="muted">/</span><span class="muted">${c.id}</span>
+      </nav>
+      <div id="detailHero" class="card glass grad reveal">
+        <div class="between" style="align-items:flex-start;gap:18px">
+          <div style="min-width:0">
+            <div class="row mb8">${Components.statusChip(c)}${Components.categoryChip(c.category)}${Components.sevDots(c.severity)}${Components.overdueBadge(c)}</div>
+            <h2 style="margin-bottom:6px">${Utils.escapeHtml(c.title)}</h2>
+            <div class="row small muted">
+              <svg width="14" height="14" aria-hidden="true"><use href="#i-pin"/></svg>${Utils.escapeHtml(c.location.address)}
+              <span>·</span>${Utils.fmtDate(c.createdAt, Store.state.lang)}
+              <span>·</span>${c.anonymous ? t('detail.anon') : Utils.escapeHtml(reporter ? reporter.name : '—')}
+              <span>·</span>${t('off.staff')}: ${Utils.escapeHtml(c.assignedTo || '—')}
+            </div>
+          </div>
+          <div class="row" style="gap:14px;align-items:center">
+            ${Components.priorityRing(c.priorityScore, Store.bandFor(c.priorityScore).color)}
+            <div class="stack" style="gap:6px">
+              <button class="btn btn-xs" id="whyBtn" aria-haspopup="dialog">${t('detail.why')}</button>
+              <button class="btn btn-xs btn-ghost" data-share="${c.id}">${t('detail.share')}</button>
+            </div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:14px;gap:10px">
+          ${Components.upvoteBtn(c)}
+          <button class="btn btn-sm ${isFollowing ? 'btn-lime' : ''}" data-follow="${c.id}" aria-pressed="${!!isFollowing}">
+            <svg width="15" height="15" aria-hidden="true"><use href="#i-heart${isFollowing ? '-fill' : ''}"/></svg>${isFollowing ? t('detail.following') : t('detail.follow')}
+          </button>
+          <button class="btn btn-sm btn-ghost" data-flag="${c.id}"><svg width="14" height="14" aria-hidden="true"><use href="#i-flag"/></svg>${t('detail.report')}</button>
+          ${official ? `<button class="btn btn-sm btn-aqua" id="assignBtn"><svg width="14" height="14" aria-hidden="true"><use href="#i-staff"/></svg>${t('detail.assign')}</button>
+            <button class="btn btn-sm btn-lime" id="proofBtn">${t('off.proof')}</button>` : ''}
+          ${Store.role === 'admin' ? `<button class="btn btn-sm" id="adminAdvance">${t('detail.advanced')}</button>` : ''}
+        </div>
+        ${c.linkedTo ? `<div class="card tight glass" style="margin-top:14px"><span class="chip bg-dup st-dup">${t('detail.duplicateOf')}</span>
+          <a href="#/c/${c.linkedTo}" style="margin-left:8px">${c.linkedTo} — ${Utils.escapeHtml(parent ? Utils.truncate(parent.title, 60) : '')}</a></div>` : ''}
+        ${(c.flags || []).some((f) => f.status === 'open') ? `<div class="card tight glass" style="margin-top:14px"><span class="chip bg-high st-high">${t('detail.flagged')}</span>
+          <span class="small" style="margin-left:8px">${Utils.escapeHtml(c.flags.filter((f) => f.status === 'open').map((f) => f.reason).join('; '))}</span></div>` : ''}
+      </div>
+
+      <div class="sidebar-layout" style="margin-top:18px">
+        <div class="stack" style="gap:16px">
+          <section class="card glass reveal" aria-labelledby="descTitle">
+            <h3 id="descTitle" class="mb8">${t('form.fDesc')}</h3>
+            <p>${Utils.escapeHtml(c.description)}</p>
+            ${!Store.state.prefs.lowbw && c.media.length ? `<div class="media-grid">${c.media.map((m, i) => /^data:video/.test(m) ? `<video src="${m}" class="thumb" controls muted></video>` : `<img src="${m}" class="thumb media" alt="Complaint photo ${i + 1}" data-zoom="${i}" tabindex="0" role="button" />`).join('')}</div>` : `<p class="hint">${t('empty.media')}</p>`}
+          </section>
+
+          ${c.resolution && c.resolution.afterPhoto ? `
+          <section class="card glass reveal" aria-labelledby="resTitle">
+            <h3 id="resTitle" class="mb8">${t('detail.resolution')}</h3>
+            <div class="cmp" style="--split:50%" aria-label="${t('detail.before')} / ${t('detail.after')}">
+              <img src="${c.media[0] || Utils.placeholderImage(c.id)}" alt="${t('detail.before')}" />
+              <div class="after"><img src="${c.resolution.afterPhoto}" alt="${t('detail.after')}" /></div>
+              <span class="tag l">${t('detail.before')}</span><span class="tag r">${t('detail.after')}</span>
+              <div class="handle" aria-label="${t('detail.before')} / ${t('detail.after')}"></div>
+            </div>
+            <p class="small" style="margin-top:10px">${Utils.escapeHtml(c.resolution.note)}</p>
+            <div class="tiny muted">${t('detail.after')} · ${Utils.fmtDate(c.resolution.at, Store.state.lang)}</div>
+            <div class="row" style="margin-top:12px;justify-content:space-between">
+              <div class="stars ro" aria-label="${t('stats.rating')}: ${c.resolution.rating || 0} / 5">${[1, 2, 3, 4, 5].map((i) => `<span class="star ${c.resolution.rating >= i ? 'on' : ''}" aria-hidden="true">★</span>`).join('')}</div>
+              ${(canConfirm || canReject) ? `<div class="row" style="gap:8px">
+                <button class="btn btn-sm btn-lime" id="confirmBtn">${t('detail.confirm')}</button>
+                <button class="btn btn-sm btn-coral" id="rejectBtn">${t('detail.reject')}</button></div>` : ''}
+            </div>
+            ${(!Store.isGuest() && Store.can('rate', c).ok) ? `<div style="margin-top:12px"><div class="tiny muted mb8">${t('detail.ratePrompt')}</div>
+              <div class="stars" id="rateStars" role="group" aria-label="${t('detail.rate')}">${[1, 2, 3, 4, 5].map((i) => `<button class="star ${c.resolution.rating >= i ? 'on' : ''}" data-star="${i}" aria-label="${i} of 5">★</button>`).join('')}</div></div>` : ''}
+            <div class="row" id="confState" style="margin-top:10px">
+              ${c.resolution.confirmed === true ? `<span class="chip bg-resolved st-resolved">${t('status.Closed')}</span>` : c.resolution.confirmed === false ? `<span class="chip bg-high st-high">${t('status.Reopened')}</span>` : `<span class="chip bg-pending st-pending">${t('detail.rate')}</span>`}
+            </div>
+          </section>` : ''}
+
+          ${dupes.length ? `<section class="card glass reveal"><h3 class="mb8">${t('detail.duplicates')}</h3>
+            <div class="c-list">${dupes.map((d) => Components.complaintCard(d, { media: false, hideSev: true })).join('')}</div></section>` : ''}
+
+          <section class="card glass reveal" aria-labelledby="cmtTitle">
+            <h3 id="cmtTitle" class="mb8">${t('detail.comments')} (${c.comments.length})</h3>
+            <div class="stack" id="commentList">
+              ${c.comments.length ? c.comments.slice().reverse().map((cm) => `
+                <article class="card tight glass flat">
+                  <div class="row between">
+                    <div class="row" style="gap:8px">${Components.avatar(Store.user(cm.by))}<strong class="small">${Utils.escapeHtml(cm.by === 'guest' ? 'Guest' : cm.name)}</strong></div>
+                    <span class="tiny muted">${Utils.ago(cm.at, Store.state.lang)}</span>
+                  </div>
+                  <p class="small" style="margin:8px 0 0">${Utils.escapeHtml(cm.text)}</p>
+                  ${cm.image && !Store.state.prefs.lowbw ? `<img src="${cm.image}" class="thumb media" style="max-width:220px;margin-top:8px" alt="Comment evidence" data-zoom="c" />` : ''}
+                </article>`).join('') : `<p class="hint">${t('empty.title')}</p>`}
+            </div>
+            <hr class="hr" />
+            <h4>${t('detail.addComment')}</h4>
+            <label class="sr" for="cmtText">${t('detail.addComment')}</label>
+            <textarea class="textarea" id="cmtText" placeholder="${Utils.escapeHtml(t('detail.commentPh'))}" maxlength="600"></textarea>
+            <div class="row between" style="margin-top:10px">
+              <div class="row">
+                <label class="btn btn-sm btn-ghost" for="cmtFile"><svg width="14" height="14" aria-hidden="true"><use href="#i-camera"/></svg>${t('form.fMedia')}</label>
+                <input type="file" id="cmtFile" accept="image/*" class="sr" />
+                <span class="tiny muted" id="cmtFileHint"></span>
+              </div>
+              <button class="btn btn-primary btn-sm" id="cmtPost">${t('detail.post')}</button>
+            </div>
+          </section>
+        </div>
+
+        <aside class="stack" style="gap:16px">
+          <section class="card glass reveal" aria-labelledby="tlTitle">
+            <h3 id="tlTitle" class="mb8">${t('detail.timeline')}</h3>
+            ${Components.timeline(c)}
+          </section>
+          <section class="card glass reveal">
+            <h3 class="mb8">${t('detail.supporters')} (${c.supporters.length})</h3>
+            ${Components.avatarStack(c.supporters, 8)}
+            <hr class="hr" />
+            <div class="stat-grid small">
+              <div><span class="muted">${t('detail.sla')}</span><br /><strong>${Utils.fmtDate(c.slaDueAt, Store.state.lang)}</strong></div>
+              <div style="margin-top:8px"><span class="muted">${t('admin.resolution')}</span><br /><strong>${c.resolution && c.resolution.at ? Utils.round((c.resolution.at - c.createdAt) / 36e5, 1) + ' h' : '—'}</strong></div>
+              <div style="margin-top:8px"><span class="muted">${t('off.staff')}</span><br /><strong>${Utils.escapeHtml(c.assignedTo || '—')}</strong></div>
+              <div style="margin-top:8px"><span class="muted">${t('form.fCat')}</span><br /><strong>${Utils.escapeHtml(c.department)}</strong></div>
+            </div>
+          </section>
+          <section class="card glass reveal">
+            <h3 class="mb8">${t('map.title')}</h3>
+            <div class="map-shell flat" style="border-radius:16px;overflow:hidden">
+              <div id="detailMap" style="height:220px"></div>
+            </div>
+            <a class="btn btn-sm btn-block" style="margin-top:10px" href="#/map">${t('nav.map')}</a>
+          </section>
+        </aside>
+      </div>
+    </div>`;
+    bind(root, c);
+  }
+  function bind(root, c) {
+    Motion.comparison(root);
+    const why = Utils.$('#whyBtn');
+    if (why) why.addEventListener('click', () => Modal.open({ title: t('detail.why'), subtitle: c.id + ' · ' + c.title, body: Components.whyPriority(c) }));
+    // lightbox for photos
+    Utils.$$('[data-zoom]', root).forEach((img) => img.addEventListener('click', () => {
+      const src = img.getAttribute('src');
+      Modal.open({ title: Utils.escapeHtml(c.title), body: `<img src="${src}" alt="${Utils.escapeHtml(c.title)}" style="width:100%;border-radius:16px" />`, wide: true });
+    }));
+    const rate = Utils.$('#rateStars');
+    if (rate) Utils.$$('[data-star]', rate).forEach((b) => b.addEventListener('click', () => {
+      const n = Number(b.dataset.star);
+      Actions.rate(c.id, n);
+      Utils.$$('.star', rate).forEach((s) => s.classList.toggle('on', Number(s.dataset.star) <= n));
+      Motion.Confetti.fromElement(b, 0.5);
+    }));
+    const confirmBtn = Utils.$('#confirmBtn');
+    if (confirmBtn) confirmBtn.addEventListener('click', async () => {
+      const after = c.resolution.afterPhoto;
+      const ok = await Modal.confirm(t('detail.confirm') + '? ' + c.id, { title: t('detail.confirm'), ok: t('detail.confirm'), danger: false });
+      if (!ok) return;
+      if (Actions.confirmFix(c.id)) Motion.Confetti.fromElement(confirmBtn, 1.4); void after;
+    });
+    const rejectBtn = Utils.$('#rejectBtn');
+    if (rejectBtn) rejectBtn.addEventListener('click', () => {
+      Modal.open({
+        title: t('detail.reject'), subtitle: c.id,
+        body: `<label for="rejNote">${t('detail.addComment')}</label><textarea class="textarea" id="rejNote" placeholder="${Utils.escapeHtml(t('detail.commentPh'))}"></textarea>`,
+        actions: [{ id: 'cancel', label: t('form.back'), class: 'btn-ghost' }, { id: 'ok', label: t('detail.reopen'), class: 'btn-coral', onClick: () => { Actions.rejectFix(c.id, document.getElementById('rejNote').value.trim()); return true; } }]
+      });
+    });
+    const post = Utils.$('#cmtPost');
+    if (post) post.addEventListener('click', () => {
+      const text = Utils.$('#cmtText').value.trim();
+      const img = pendingCommentImage;
+      if (Actions.comment(c.id, text, img)) { pendingCommentImage = null; }
+    });
+    const cf = Utils.$('#cmtFile');
+    if (cf) cf.addEventListener('change', async () => {
+      const f = cf.files && cf.files[0];
+      if (!f) return;
+      pendingCommentImage = await Utils.downscaleImage(f, 900, 0.7);
+      Utils.$('#cmtFileHint').textContent = f.name + ' · ' + t('toast.mediaAdded');
+    });
+    const assignBtn = Utils.$('#assignBtn');
+    if (assignBtn) assignBtn.addEventListener('click', () => openAssign(c));
+    const proofBtn = Utils.$('#proofBtn');
+    if (proofBtn) proofBtn.addEventListener('click', () => openProof(c));
+    const adv = Utils.$('#adminAdvance');
+    if (adv) adv.addEventListener('click', () => {
+      const next = { Submitted: 'Verified', Verified: 'Assigned', Assigned: 'In Progress', 'In Progress': 'Resolved', Resolved: 'Closed', Closed: 'Reopened', Reopened: 'Assigned' }[c.status];
+      if (next === 'Resolved') { openProof(c); return; }
+      Actions.transition(c.id, next, { by: 'admin', note: 'Admin override' });
+    });
+    // Small map for the location
+    const dEl = Utils.$('#detailMap');
+    if (dEl && typeof window.L !== 'undefined') {
+      const m = L.map(dEl, { zoomControl: false, dragging: !Motion.reduced(), scrollWheelZoom: false, attributionControl: false }).setView([c.location.lat, c.location.lng], 16);
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(m);
+      L.marker([c.location.lat, c.location.lng], {
+        icon: L.divIcon({ className: '', html: `<div class="mk-pin mk-drop" style="width:18px;height:18px;background:${STATUS_COLOR[Store.statusColorKey(c)]};color:${STATUS_COLOR[Store.statusColorKey(c)]}"></div>`, iconSize: [18, 18], iconAnchor: [9, 9] })
+      }).addTo(m);
+      setTimeout(() => m.invalidateSize(), 180);
+      detailMapRefs.push(m);
+    }
+  }
+  let pendingCommentImage = null;
+  const detailMapRefs = [];
+  function destroy() { while (detailMapRefs.length) { const m = detailMapRefs.pop(); try { m.remove(); } catch (e) { /* noop */ } } }
+  return { id: 'detail:' + id, render, destroy };
+};
+/** Shared proof-upload modal (used by detail view and the official board). */
+function openProof(c) {
+  let dataUrl = null;
+  Modal.open({
+    title: t('off.proof'), subtitle: c.id + ' · ' + c.title, wide: true,
+    body: `<div class="grid g-2">
+      <div>
+        <div class="dropzone" id="proofDrop" tabindex="0" role="button" aria-label="${t('form.drop')}">
+          <svg width="26" height="26" aria-hidden="true"><use href="#i-camera"/></svg>
+          <div style="font-weight:700;margin-top:8px">${t('form.drop')}</div>
+          <div class="tiny muted">${t('detail.after')} — ${t('form.fMediaHint')}</div>
+          <input type="file" id="proofFile" accept="image/*" class="sr" />
+        </div>
+        <div id="proofPreview" class="media-grid" style="margin-top:12px"></div>
+      </div>
+      <div>
+        <label for="proofNote">${t('form.fDesc')} *</label>
+        <textarea class="textarea" id="proofNote" placeholder="${Utils.escapeHtml(t('detail.commentPh'))}" maxlength="400"></textarea>
+        <p class="hint">${t('toast.proofNeeded')}</p>
+        <div class="row" style="gap:8px;margin-top:10px">
+          <span class="chip bg-pending st-pending">${t('status.' + c.status)} → ${t('status.Resolved')}</span>
+        </div>
+      </div></div>`,
+    actions: [
+      { id: 'cancel', label: t('form.back'), class: 'btn-ghost' },
+      { id: 'ok', label: t('form.submit'), class: 'btn-lime', disabled: true, onClick: () => { Actions.resolve(c.id, { afterPhoto: dataUrl, note: document.getElementById('proofNote').value }); return true; } }
+    ],
+    onMount(box) {
+      const drop = box.querySelector('#proofDrop'), file = box.querySelector('#proofFile'), preview = box.querySelector('#proofPreview');
+      const okBtn = box.querySelector('[data-act="ok"]');
+      const validate = () => { okBtn.disabled = !(dataUrl && box.querySelector('#proofNote').value.trim().length > 5); };
+      box.querySelector('#proofNote').addEventListener('input', validate);
+      drop.addEventListener('click', () => file.click());
+      drop.addEventListener('keydown', (e) => { if (e.key === 'Enter') file.click(); });
+      file.addEventListener('change', async () => {
+        const f = file.files && file.files[0];
+        if (!f) return;
+        dataUrl = await Utils.downscaleImage(f);
+        preview.innerHTML = dataUrl ? `<div class="media-item scan-wrap"><img src="${dataUrl}" alt="${t('detail.after')}" /><div class="scan-line" aria-hidden="true"></div></div>` : '';
+        validate();
+      });
+      setTimeout(() => { box.querySelector('#proofNote').focus(); }, 80);
+    }
+  });
+}
+/** Assign-to-staff modal. */
+function openAssign(c) {
+  const staff = STAFF[c.department] || ['Field crew'];
+  Modal.open({
+    title: t('detail.assign'), subtitle: c.id + ' · ' + c.department,
+    body: `<label for="staffSel">${t('off.staff')}</label>
+      <select class="select" id="staffSel">${staff.map((s) => `<option>${Utils.escapeHtml(s)}</option>`).join('')}</select>
+      <label for="assignNote" style="margin-top:12px">${t('form.fDesc')}</label>
+      <input class="input" id="assignNote" placeholder="${Utils.escapeHtml(t('detail.commentPh'))}" maxlength="140" data-autofocus />`,
+    actions: [{ id: 'cancel', label: t('form.back'), class: 'btn-ghost' },
+      { id: 'ok', label: t('off.assign'), class: 'btn-primary', onClick: () => { Actions.assign(c.id, document.getElementById('staffSel').value, document.getElementById('assignNote').value); return true; } }]
+  });
+}
+
+/* ==========================================================================
+ * 16. VIEW: CITIZEN DASHBOARD — my tickets, notifications context, nearby feed
+ * ======================================================================== */
+const MineView = () => {
+  let tab = 'filed';
+  function render(root) {
+    const u = Store.me();
+    if (!u) {
+      root.innerHTML = `<div class="wrap section">${Components.empty(t('auth.title'), t('auth.roleLocked'), `<a class="btn btn-primary" href="#/auth">${t('auth.title')}</a>`)}</div>`;
+      return;
+    }
+    const filed = Store.myComplaints();
+    const supporting = Store.supportedComplaints();
+    const following = Store.state.complaints.filter((c) => c.followers.includes(u.id));
+    const list = tab === 'filed' ? filed : tab === 'supporting' ? supporting : following;
+    const myResolved = filed.filter((c) => c.status === 'Resolved' || c.status === 'Closed').length;
+    const myRatings = filed.map((c) => c.resolution && c.resolution.rating).filter((r) => r);
+    const anchor = filed.length ? filed[0].location : null;
+    const nearby = Store.state.complaints
+      .filter((c) => {
+        if (c.removed || c.reporterId === u.id) return false;
+        if (!anchor) return true;
+        return Utils.haversine(anchor, c.location) < 3000;
+      })
+      .slice().sort((a, b) => b.priorityScore - a.priorityScore).slice(0, 6);
+    root.innerHTML = `
+    <div class="wrap section">
+      <div class="between reveal">
+        <div>
+          <h2 style="margin-bottom:2px">${t('mine.title')}</h2>
+          <p class="muted mb0 small">${t('mine.sub')}</p>
+        </div>
+        <div class="row">
+          <a class="btn btn-primary" href="#/report">${t('hero.cta1')}</a>
+          <a class="btn" href="#/map">${t('nav.map')}</a>
+        </div>
+      </div>
+      <div class="grid g-4" style="margin-top:18px">
+        ${Components.kpi(t('mine.filed'), filed.length, { color: '#22D3EE' })}
+        ${Components.kpi(t('stat.resolved'), myResolved, { color: '#34D399' })}
+        ${Components.kpi(t('mine.supporting'), supporting.length, { color: '#A3E635' })}
+        ${Components.kpi(t('stat.rating'), myRatings.length ? Utils.round(myRatings.reduce((a, b) => a + b, 0) / myRatings.length, 1) : 0, { dec: 1, suffix: '/5', color: '#FBBF24' })}
+      </div>
+      <div class="sidebar-layout" style="margin-top:18px">
+        <div>
+          <div class="tabs" role="tablist">
+            ${[['filed', t('mine.filed')], ['supporting', t('mine.supporting')], ['following', t('mine.following')]].map(([k, l]) =>
+              `<button class="tab" role="tab" aria-selected="${tab === k}" data-tab="${k}">${l} (${k === 'filed' ? filed.length : k === 'supporting' ? supporting.length : following.length})</button>`).join('')}
+          </div>
+          <div class="c-list" id="mineList">
+            ${list.length ? list.map((c) => `<div>${Components.complaintCard(c)}<div class="tiny muted" style="margin:-8px 0 14px 6px">${t('detail.timeline')}: ${t('status.' + c.statusHistory[c.statusHistory.length - 1].status)} · ${Utils.ago(c.statusHistory[c.statusHistory.length - 1].at, Store.state.lang)}</div></div>`).join('')
+              : Components.empty(t('empty.title'), t('mine.empty'), `<a class="btn btn-primary" href="#/report">${t('hero.cta1')}</a>`)}
+          </div>
+        </div>
+        <aside class="stack" style="gap:16px">
+          <section class="card glass reveal">
+            <h3 class="mb8">${t('mine.nearby')}</h3>
+            <div class="c-list" style="gap:10px">
+              ${nearby.length ? nearby.map((c) => Components.complaintCard(c, { media: false, showSla: false })).join('') : `<p class="hint">${t('empty.title')}</p>`}
+            </div>
+          </section>
+          <section class="card glass reveal">
+            <h3 class="mb8">${t('mine.impact')}</h3>
+            <div class="flow">
+              <div class="flow-row"><span>${t('mine.filed')}</span><span class="bar"><i style="width:${Utils.pct(filed.length, Math.max(6, filed.length))}%"></i></span><span class="mono">${filed.length}</span></div>
+              <div class="flow-row"><span>${t('stat.resolved')}</span><span class="bar"><i style="width:${Utils.pct(myResolved, Math.max(1, filed.length))}%"></i></span><span class="mono">${myResolved}</span></div>
+              <div class="flow-row"><span>${t('mine.supporting')}</span><span class="bar"><i style="width:${Utils.pct(supporting.length, Math.max(6, supporting.length))}%"></i></span><span class="mono">${supporting.length}</span></div>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </div>`;
+    Utils.$$('[data-tab]', root).forEach((b) => b.addEventListener('click', () => { tab = b.dataset.tab; render(root); }));
+  }
+  return { id: 'mine', render };
+};
+
+/* ==========================================================================
+ * 17. VIEW: OFFICIAL DASHBOARD — Kanban w/ validated drag-drop, SLA, briefings
+ * ======================================================================== */
+const OfficialView = () => {
+  const COLUMNS = ['Submitted', 'Verified', 'Assigned', 'In Progress', 'Resolved'];
+  function scoped() {
+    const dept = Store.myDept();
+    let list = Store.state.complaints.filter((c) => !c.removed && (!dept || c.department === dept));
+    const f = Store.state.filters.official;
+    if (f.overdueOnly) list = Store.overdue(list);
+    list = list.filter((c) => c.severity >= f.minSev);
+    const dir = f.dir === 'asc' ? 1 : -1;
+    const key = { priority: 'priorityScore', age: 'createdAt', severity: 'severity', title: 'title' }[f.sort] || 'priorityScore';
+    list = list.slice().sort((a, b) => (typeof a[key] === 'string' ? String(a[key]).localeCompare(String(b[key])) * dir : (a[key] - b[key]) * dir));
+    return list;
+  }
+  function render(root) {
+    const dept = Store.myDept();
+    if (Store.role !== 'official' && Store.role !== 'admin') {
+      root.innerHTML = `<div class="wrap section">${Components.empty(t('off.title'), t('toast.roleDenied'), `<a class="btn btn-primary" href="#/auth">${t('auth.title')}</a>`)}</div>`;
+      return;
+    }
+    const list = scoped();
+    const late = Store.overdue(list);
+    const avgAge = list.length ? Utils.round(list.reduce((s, c) => s + (Utils.now() - c.createdAt) / 36e5, 0) / list.length, 1) : 0;
+    const view = Store.state.ui.tabBoard;
+    root.innerHTML = `
+    <div class="wrap section">
+      <div class="between reveal">
+        <div>
+          <h2 style="margin-bottom:2px">${t('off.title')}</h2>
+          <p class="muted mb0 small">${t('off.sub', { dept: dept || 'All departments' })}</p>
+        </div>
+        <div class="row">
+          <label class="sr" for="deptSwitch">${t('off.title')}</label>
+          <select class="select" id="deptSwitch" style="width:auto">
+            ${Store.state.departments.map((d) => `<option ${d.name === dept ? 'selected' : ''}>${Utils.escapeHtml(d.name)}</option>`).join('')}
+          </select>
+          <div class="segmented" id="boardTable" role="group" aria-label="${t('off.board')}">
+            <button data-view="board" aria-pressed="${view === 'board'}">${t('off.board')}</button>
+            <button data-view="table" aria-pressed="${view === 'table'}">${t('off.table')}</button>
+          </div>
+          <button class="btn btn-aqua" id="briefBtn"><svg width="15" height="15" aria-hidden="true"><use href="#i-doc"/></svg>${t('off.brief')}</button>
+        </div>
+      </div>
+      <div class="grid g-4" style="margin-top:16px">
+        ${Components.kpi(t('off.title'), list.length, { color: '#22D3EE' })}
+        ${Components.kpi(t('tab.overdue'), late.length, { color: '#FF5C7A', sub: late.length ? late[0].id : '—' })}
+        ${Components.kpi(t('off.age'), avgAge, { dec: 1, suffix: ' h', color: '#FBBF24' })}
+        ${Components.kpi(t('stat.resolved'), list.filter((c) => c.status === 'Resolved' || c.status === 'Closed').length, { color: '#34D399' })}
+      </div>
+      <div class="row between" style="margin-top:16px">
+        <div class="row">
+          <label class="small" for="sevFilter">${t('off.filterSev')}</label>
+          <select class="select" id="sevFilter" style="width:auto">${[1, 2, 3, 4, 5].map((n) => `<option value="${n}" ${Store.state.filters.official.minSev === n ? 'selected' : ''}>${n}+</option>`).join('')}</select>
+          <label class="switch"><input type="checkbox" id="overdueToggle" ${Store.state.filters.official.overdueOnly ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('off.overdueOnly')}</span></label>
+        </div>
+        <span class="tiny muted">${t('feat.proof')}</span>
+      </div>
+      <div id="briefOut" class="card glass flat hide" style="margin-top:14px"><pre id="briefText" style="white-space:pre-wrap;margin:0;font-size:.86rem"></pre></div>
+      <div style="margin-top:16px" id="queueHost">
+        ${view === 'board' ? boardHtml(list) : tableHtml(list)}
+      </div>
+    </div>`;
+    bind(root, list);
+  }
+  function boardHtml(list) {
+    return `<div class="kanban" id="kanban" role="list">
+      ${COLUMNS.map((col) => {
+        const items = list.filter((c) => (STATUS_TO_COLUMN[c.status] || c.status) === col);
+        return `<section class="kcol" data-col="${col}" role="listitem" aria-label="${t('status.' + col)} (${items.length})">
+          <div class="row between" style="margin-bottom:10px">
+            <strong class="small">${t('status.' + col)}</strong><span class="chip">${items.length}</span>
+          </div>
+          ${items.length ? items.map((c) => kcard(c)).join('') : `<p class="hint small">${t('off.empty')}</p>`}
+        </section>`;
+      }).join('')}
+    </div>`;
+  }
+  function kcard(c) {
+    return `<article class="kcard" draggable="true" data-id="${c.id}" tabindex="0" aria-label="${c.id} ${Utils.escapeHtml(c.title)}">
+      <div class="row between mb8">${Components.statusChip(c)}<span class="tiny muted">${c.id}</span></div>
+      <strong class="small" style="display:block">${Utils.escapeHtml(Utils.truncate(c.title, 62))}</strong>
+      <div class="row" style="margin-top:8px;gap:8px">
+        ${Components.sevDots(c.severity)}
+        <span class="chip">${t('cat.' + c.category)}</span>
+        ${Components.overdueBadge(c)}
+      </div>
+      <div class="row between" style="margin-top:8px">
+        <span class="tiny muted">${Utils.ago(c.createdAt, Store.state.lang)} · ${c.supporters.length} ↑</span>
+        <span class="tiny"><strong class="st-${Store.statusColorKey(c)}">${c.priorityScore}</strong>/100</span>
+      </div>
+      <div class="row" style="margin-top:8px;gap:6px">
+        <button class="btn btn-xs" data-open="${c.id}">${t('action.open')}</button>
+        <button class="btn btn-xs btn-ghost" data-assign="${c.id}">${t('off.assign')}</button>
+        <button class="btn btn-xs btn-lime" data-proof="${c.id}">${t('off.proof')}</button>
+      </div>
+    </article>`;
+  }
+  function tableHtml(list) {
+    const f = Store.state.filters.official;
+    const th = (key, label, num) => `<th scope="col"><button data-sort="${key}" aria-sort="${f.sort === key ? (f.dir === 'asc' ? 'ascending' : 'descending') : 'none'}">${label}${f.sort === key ? (f.dir === 'asc' ? ' ↑' : ' ↓') : ''}</button></th>`;
+    return `<div class="table-wrap"><table>
+      <caption class="sr">${t('off.title')}</caption>
+      <thead><tr>${th('title', t('form.fTitle'))}${th('severity', t('off.filterSev'))}${th('priority', 'Priority')}${th('age', t('off.age'))}<th scope="col">${t('map.filterStatus')}</th><th scope="col">SLA</th><th scope="col">${t('off.staff')}</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+      <tbody>${list.length ? list.map((c) => `<tr>
+        <td data-open="${c.id}" tabindex="0" role="button"><strong>${c.id}</strong><div class="tiny muted">${Utils.escapeHtml(Utils.truncate(c.title, 52))}</div></td>
+        <td>${Components.sevDots(c.severity)}</td>
+        <td class="num"><strong class="st-${Store.statusColorKey(c)}">${c.priorityScore}</strong></td>
+        <td class="num">${Utils.round((Utils.now() - c.createdAt) / 36e5, 1)} h</td>
+        <td>${Components.statusChip(c)}</td>
+        <td>${Components.overdueBadge(c)}</td>
+        <td>${Utils.escapeHtml(c.assignedTo || '—')}</td>
+        <td><div class="row" style="gap:6px"><button class="btn btn-xs" data-assign="${c.id}">${t('off.assign')}</button><button class="btn btn-xs btn-lime" data-proof="${c.id}">${t('off.proof')}</button></div></td>
+      </tr>`).join('') : `<tr><td colspan="8">${t('off.empty')}</td></tr>`}</tbody>
+    </table></div>`;
+  }
+  function bind(root, list) {
+    Utils.$$('[data-view]', root).forEach((b) => b.addEventListener('click', () => { Store.state.ui.tabBoard = b.dataset.view; render(root); }));
+    const deptSel = Utils.$('#deptSwitch');
+    if (deptSel) deptSel.addEventListener('change', () => { Store.Auth.switchDepartment(deptSel.value); Toast.show(deptSel.value, 'info'); Router.render(true); });
+    const sev = Utils.$('#sevFilter');
+    if (sev) sev.addEventListener('change', () => { Store.state.filters.official.minSev = Number(sev.value); render(root); });
+    const ov = Utils.$('#overdueToggle');
+    if (ov) ov.addEventListener('change', () => { Store.state.filters.official.overdueOnly = ov.checked; render(root); });
+    Utils.$$('[data-sort]', root).forEach((b) => b.addEventListener('click', () => {
+      const key = b.dataset.sort, f = Store.state.filters.official;
+      if (f.sort === key) f.dir = f.dir === 'asc' ? 'desc' : 'asc'; else { f.sort = key; f.dir = 'desc'; }
+      render(root);
+    }));
+    Utils.$$('[data-assign]', root).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); openAssign(Store.complaint(b.dataset.assign)); }));
+    Utils.$$('[data-proof]', root).forEach((b) => b.addEventListener('click', (e) => { e.stopPropagation(); openProof(Store.complaint(b.dataset.proof)); }));
+    const briefBtn = Utils.$('#briefBtn');
+    if (briefBtn) briefBtn.addEventListener('click', () => {
+      const box = Utils.$('#briefOut'); const txt = Utils.$('#briefText');
+      txt.textContent = Services.summarizeForOfficials(list, Store.myDept() || 'all departments');
+      box.classList.remove('hide');
+      Toast.show(t('toast.brief'), 'ok');
+      box.scrollIntoView({ behavior: Motion.reduced() ? 'auto' : 'smooth', block: 'nearest' });
+    });
+    /* ---------- drag & drop with state-machine validation ---------- */
+    let dragId = null;
+    Utils.$$('.kcard', root).forEach((el) => {
+      el.addEventListener('dragstart', (e) => { dragId = el.dataset.id; el.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; try { e.dataTransfer.setData('text/plain', dragId); } catch (err) { /* Safari */ } });
+      el.addEventListener('dragend', () => { el.classList.remove('dragging'); });
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') Router.go('#/c/' + el.dataset.id);
+      });
+    });
+    Utils.$$('.kcol', root).forEach((col) => {
+      col.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        const target = col.dataset.col;
+        const c = Store.complaint(dragId);
+        const ok = c && TRANSITIONS[c.status] && TRANSITIONS[c.status][target];
+        col.classList.toggle('drop-ok', !!ok); col.classList.toggle('drop-bad', !ok);
+      });
+      col.addEventListener('dragleave', () => { col.classList.remove('drop-ok', 'drop-bad'); });
+      col.addEventListener('drop', (e) => {
+        e.preventDefault();
+        col.classList.remove('drop-ok', 'drop-bad');
+        const target = col.dataset.col;
+        const c = Store.complaint(dragId);
+        if (!c) return;
+        if (target === 'Resolved') { openProof(c); return; }
+        const chk = Store.can(target === 'In Progress' ? 'progress' : target === 'Assigned' ? 'assign' : 'verify', c);
+        if (!chk.ok) { shake(c.id); Toast.show(t('toast.roleDenied'), 'err'); return; }
+        if (target === 'Assigned' && c.status === 'Verified') { openAssign(c); return; }
+        const res = Actions.transition(c.id, target, { by: 'official', note: 'Moved on the department board' });
+        if (!res.ok) shake(c.id);
+      });
+    });
+    function shake(id) {
+      const card = Utils.$('[data-id="' + id + '"]', root);
+      if (card) { card.classList.add('shake'); setTimeout(() => card.classList.remove('shake'), 500); }
+    }
+  }
+  const update = () => render(Utils.$('#viewRoot'));
+  return { id: 'official', render, update };
+};
+
+/* ==========================================================================
+ * 18. VIEW: ADMIN IMPACT DASHBOARD — charts, SLA rules, flags, CSV
+ * ======================================================================== */
+const AdminView = () => {
+  let flagTab = 'open';
+  function render(root) {
+    if (Store.role !== 'admin') {
+      root.innerHTML = `<div class="wrap section">${Components.empty(t('admin.title'), t('toast.roleDenied'), `<a class="btn btn-primary" href="#/auth">${t('auth.title')}</a>`)}</div>`;
+      return;
+    }
+    const m = Store.computeMetrics();
+    const hot = Store.hotspots(300);
+    const flags = Store.flaggedComplaints();
+    root.innerHTML = `
+    <div class="wrap section">
+      <div class="between reveal">
+        <div><h2 style="margin-bottom:2px">${t('admin.title')}</h2><p class="muted mb0 small">${t('admin.sub')}</p></div>
+        <div class="row">
+          <button class="btn btn-aqua" id="exportBtn"><svg width="15" height="15" aria-hidden="true"><use href="#i-download"/></svg>${t('admin.export')}</button>
+          <button class="btn" id="adminBrief"><svg width="15" height="15" aria-hidden="true"><use href="#i-doc"/></svg>${t('admin.summary')}</button>
+        </div>
+      </div>
+      <div class="grid g-4" style="margin-top:16px">
+        ${Components.kpi(t('admin.compliance'), m.slaPct, { suffix: '%', spark: m.byDept.map((d) => d.slaPct), color: '#A3E635', sub: `${m.withinSla}/${m.resolvedCount}` })}
+        ${Components.kpi(t('admin.avgRating'), m.avgRating ? Utils.round(m.avgRating, 1) : 0, { dec: 1, suffix: '/5', color: '#FBBF24', sub: `${m.ratingCount} ${t('detail.rate')}` })}
+        ${Components.kpi(t('admin.affected'), m.affected, { spark: m.trend.map((d) => d.filed + d.closed), color: '#22D3EE', sub: `${m.total} ${t('stat.reports')}` })}
+        ${Components.kpi(t('admin.resolution'), Utils.round(m.avgResolutionHours, 1), { dec: 1, suffix: ' h', color: '#FF5C7A', sub: `${m.overdue} ${t('tab.overdue')}` })}
+      </div>
+      <div id="adminBriefOut" class="card glass flat hide" style="margin-top:14px"><pre id="adminBriefText" style="white-space:pre-wrap;margin:0;font-size:.86rem"></pre></div>
+
+      <div class="grid g-2" style="margin-top:18px">
+        <section class="card glass reveal" aria-labelledby="catChartT">
+          <h3 id="catChartT" class="mb8">${t('stats.byCat')}</h3>
+          <div style="height:280px"><canvas id="chartCat" aria-label="${t('stats.byCat')}" role="img"></canvas></div>
+          <div id="chartCatFallback" class="hide small muted">${m.byCategory.map((c) => `${t('cat.' + c.cat)}: ${c.n}`).join(' · ')}</div>
+        </section>
+        <section class="card glass reveal" aria-labelledby="deptChartT">
+          <h3 id="deptChartT" class="mb8">${t('admin.resolution')} — ${t('stats.byDept')}</h3>
+          <div style="height:280px"><canvas id="chartDept" aria-label="${t('stats.byDept')}" role="img"></canvas></div>
+          <div id="chartDeptFallback" class="hide small muted">${m.byDept.map((d) => `${d.name}: ${Utils.round(d.avgHours, 1)}h`).join(' · ')}</div>
+        </section>
+        <section class="card glass reveal" aria-labelledby="trendT">
+          <h3 id="trendT" class="mb8">${t('stats.trend')}</h3>
+          <div style="height:300px"><canvas id="chartTrend" aria-label="${t('stats.trend')}" role="img"></canvas></div>
+        </section>
+        <section class="card glass reveal" aria-labelledby="slaGaugeT">
+          <h3 id="slaGaugeT" class="mb8">${t('admin.compliance')}</h3>
+          <div style="height:220px"><canvas id="chartSla" aria-label="${t('admin.compliance')}" role="img"></canvas></div>
+          <div class="row" style="justify-content:space-around;margin-top:10px">
+            <span class="heat-chip"><span class="legend-dot" style="background:var(--st-resolved)"></span>${t('pri.resolved')} ${m.byColor.resolved}</span>
+            <span class="heat-chip"><span class="legend-dot" style="background:var(--st-high)"></span>${t('tab.overdue')} ${m.overdue}</span>
+            <span class="heat-chip"><span class="legend-dot" style="background:var(--st-dup)"></span>${t('pri.dup')} ${m.byColor.dup}</span>
+          </div>
+        </section>
+      </div>
+
+      <div class="sidebar-layout" style="margin-top:18px">
+        <section class="card glass reveal" aria-labelledby="flagT">
+          <div class="between mb8">
+            <h3 id="flagT" style="margin:0">${t('admin.flags')} (${flags.length})</h3>
+            <div class="segmented" role="group" aria-label="${t('admin.flags')}">
+              <button data-flagtab="open" aria-pressed="${flagTab === 'open'}">${t('detail.flagged')}</button>
+              <button data-flagtab="all" aria-pressed="${flagTab === 'all'}">${t('tab.all')}</button>
+            </div>
+          </div>
+          <div class="stack" id="flagList">
+            ${(flagTab === 'open' ? flags : Store.state.complaints.filter((c) => c.flags && c.flags.length)).map((c) => `
+              <article class="card tight glass flat" data-flagcard="${c.id}">
+                <div class="row between">
+                  <div class="row" style="gap:8px">${Components.statusChip(c)}<strong class="small">${c.id}</strong><span class="tiny muted">${t('cat.' + c.category)}</span></div>
+                  <span class="tiny muted">${Utils.ago(c.createdAt, Store.state.lang)}</span>
+                </div>
+                <strong style="display:block;margin-top:6px">${Utils.escapeHtml(Utils.truncate(c.title, 72))}</strong>
+                <p class="tiny muted" style="margin:4px 0">${Utils.escapeHtml((c.flags[0] || {}).reason || '')}</p>
+                <div class="row" style="gap:8px">
+                  <button class="btn btn-xs" data-open="${c.id}">${t('action.open')}</button>
+                  <button class="btn btn-xs btn-lime" data-flag-approve="${c.id}">${t('admin.approve')}</button>
+                  <button class="btn btn-xs btn-coral" data-flag-reject="${c.id}">${t('admin.reject')}</button>
+                  <button class="btn btn-xs btn-ghost" data-ban="${c.reporterId}">${t('admin.ban')}</button>
+                </div>
+              </article>`).join('') || Components.empty(t('empty.title'), t('admin.flags'))}
+          </div>
+        </section>
+
+        <aside class="stack" style="gap:16px">
+          <section class="card glass reveal" aria-labelledby="slaT">
+            <h3 id="slaT" class="mb8">${t('admin.slaHours')}</h3>
+            <div class="stack" style="gap:10px">
+              ${CATEGORIES.map((cat) => `<div class="row between">
+                <label class="small" for="sla-${cat.id}" style="margin:0">${t('cat.' + cat.id)}</label>
+                <div class="row" style="gap:6px">
+                  <input class="input" id="sla-${cat.id}" data-sla="${cat.id}" type="number" min="1" max="720" value="${cat.slaHours}" style="width:92px" aria-label="${t('admin.slaHours')} ${t('cat.' + cat.id)}" />
+                  <span class="tiny muted">h</span>
+                </div>
+              </div>`).join('')}
+            </div>
+            <p class="tiny muted" style="margin-top:10px">${t('toast.slaSaved')}</p>
+          </section>
+          <section class="card glass reveal" aria-labelledby="hotT">
+            <h3 id="hotT" class="mb8">${t('admin.hotspots')}</h3>
+            <div class="stack" style="gap:8px">
+              ${hot.length ? hot.slice(0, 6).map((h, i) => `<div class="row between">
+                <div class="row" style="gap:8px"><span class="chip">#${i + 1}</span><span class="small">${Utils.escapeHtml(h.area)}</span></div>
+                <span class="tiny muted">${h.count} · ${Math.round(h.score)}/100</span></div>`).join('') : `<p class="hint small">${t('empty.title')}</p>`}
+            </div>
+          </section>
+          <section class="card glass reveal" aria-labelledby="deptT">
+            <h3 id="deptT" class="mb8">${t('off.title')} — ${t('stats.byDept')}</h3>
+            <div class="stack" style="gap:8px">
+              ${Store.state.departments.map((d) => {
+                const s = m.byDept.find((x) => x.id === d.id) || { total: 0, slaPct: 100, avgHours: 0 };
+                return `<div><div class="row between"><span class="small">${Utils.escapeHtml(d.name)}</span><span class="tiny muted">${s.total} · ${s.slaPct}%</span></div>
+                <span class="bar sm" style="display:block;margin-top:4px"><i style="width:${s.slaPct}%"></i></span></div>`;
+              }).join('')}
+            </div>
+            <button class="btn btn-sm btn-block" style="margin-top:12px" id="addDeptBtn">${t('admin.slaHours')} · +</button>
+          </section>
+        </aside>
+      </div>
+    </div>`;
+    bind(root, m);
+    drawCharts(m);
+  }
+  function drawCharts(m) {
+    if (!Charts.available()) {
+      const a = Utils.$('#chartCatFallback'), b = Utils.$('#chartDeptFallback');
+      if (a) a.classList.remove('hide'); if (b) b.classList.remove('hide');
+      return;
+    }
+    Charts.make('chartCat', {
+      type: 'doughnut',
+      data: { labels: m.byCategory.map((c) => t('cat.' + c.cat)), datasets: [{ data: m.byCategory.map((c) => c.n), backgroundColor: m.byCategory.map((c) => c.color), borderWidth: 0, hoverOffset: 8 }] },
+      options: { cutout: '62%', plugins: { legend: { position: 'bottom' } } }
+    });
+    Charts.make('chartDept', {
+      type: 'bar',
+      data: {
+        labels: m.byDept.map((d) => d.name.split('—')[0].trim()),
+        datasets: [
+          { label: t('stats.hours'), data: m.byDept.map((d) => Utils.round(d.avgHours, 1)), backgroundColor: 'rgba(34,211,238,.75)', borderRadius: 8, maxBarThickness: 34 },
+          { label: t('tab.overdue'), data: m.byDept.map((d) => Store.overdue(Store.state.complaints.filter((c) => c.department === d.name)).length), backgroundColor: 'rgba(255,92,122,.8)', borderRadius: 8, maxBarThickness: 34 }
+        ]
+      }
+    });
+    Charts.make('chartTrend', {
+      type: 'line',
+      data: {
+        labels: m.trend.map((d) => Utils.fmtDay(d.date, Store.state.lang)),
+        datasets: [
+          { label: t('stat.reports'), data: m.trend.map((d) => d.filed), borderColor: '#7C3AED', backgroundColor: 'rgba(124,58,237,.18)', fill: true, tension: .38, pointRadius: 0, borderWidth: 2.4 },
+          { label: t('pri.resolved'), data: m.trend.map((d) => d.closed), borderColor: '#34D399', backgroundColor: 'rgba(52,211,153,.14)', fill: true, tension: .38, pointRadius: 0, borderWidth: 2.4 }
+        ]
+      },
+      options: { plugins: { legend: { position: 'bottom' } } }
+    });
+    Charts.make('chartSla', {
+      type: 'doughnut',
+      data: { labels: [t('stat.sla'), t('tab.overdue')], datasets: [{ data: [m.slaPct, Math.max(0, 100 - m.slaPct)], backgroundColor: ['#34D399', 'rgba(255,255,255,.12)'], borderWidth: 0, circumference: 240, rotation: 240, cutout: '74%' }] },
+      options: { plugins: { legend: { display: false }, tooltip: { enabled: true } } }
+    });
+  }
+  function bind(root, m) {
+    Utils.$$('[data-flagtab]', root).forEach((b) => b.addEventListener('click', () => { flagTab = b.dataset.flagtab; render(root); }));
+    Utils.$$('[data-flag-approve]', root).forEach((b) => b.addEventListener('click', () => {
+      const c = Store.complaint(b.dataset.flagApprove);
+      c.flags.forEach((f, i) => { if (f.status === 'open') Actions.reviewFlag(c.id, i, 'approve'); });
+      render(root);
+    }));
+    Utils.$$('[data-flag-reject]', root).forEach((b) => b.addEventListener('click', () => {
+      const c = Store.complaint(b.dataset.flagReject);
+      c.flags.forEach((f, i) => { if (f.status === 'open') Actions.reviewFlag(c.id, i, 'remove'); });
+      render(root);
+    }));
+    Utils.$$('[data-ban]', root).forEach((b) => b.addEventListener('click', () => { Actions.banReporter(b.dataset.ban); render(root); }));
+    Utils.$$('[data-sla]', root).forEach((inp) => inp.addEventListener('change', () => { Actions.setSla(inp.dataset.sla, inp.value); render(root); }));
+    const addDept = Utils.$('#addDeptBtn');
+    if (addDept) addDept.addEventListener('click', () => Modal.open({
+      title: t('admin.slaHours'), subtitle: t('off.title'),
+      body: `<label for="ndName">${t('off.title')}</label><input class="input" id="ndName" placeholder="Parks & Playgrounds" data-autofocus />
+        <label for="ndHead" style="margin-top:12px">${t('off.staff')}</label><input class="input" id="ndHead" placeholder="Er. Name" />
+        <label for="ndMail" style="margin-top:12px">${t('auth.email')}</label><input class="input" id="ndMail" type="email" placeholder="parks@tambaram.tn.gov.in" />`,
+      actions: [{ id: 'cancel', label: t('form.back'), class: 'btn-ghost' },
+        { id: 'ok', label: t('auth.register'), class: 'btn-primary', onClick: () => {
+          const name = document.getElementById('ndName').value.trim();
+          if (name.length < 4) { Toast.show(t('form.tooShort', { n: 4 }), 'warn'); return false; }
+          Actions.addDepartment({ name, head: document.getElementById('ndHead').value.trim() || '—', email: document.getElementById('ndMail').value.trim() || 'desk@tambaram.tn.gov.in', phone: '044-2226 1100', ward: 'All wards', categories: [] });
+          render(root); return true;
+        } }]
+    }));
+    const ex = Utils.$('#exportBtn');
+    if (ex) ex.addEventListener('click', () => {
+      const chk = Store.can('exportCSV'); if (!chk.ok) { Toast.show(t('toast.roleDenied'), 'err'); return; }
+      const rows = Store.state.complaints.filter((c) => !c.removed).map((c) => ({
+        id: c.id, title: c.title, category: c.category, department: c.department, status: c.status,
+        severity: c.severity, priority: c.priorityScore, supporters: c.supporters.length, followers: c.followers.length,
+        flags: c.flags.length, sentiment: c.sentiment ?? c.sentimentScore ?? '', lat: c.location.lat, lng: c.location.lng,
+        address: c.location.address, created: new Date(c.createdAt).toISOString(), sla_due: new Date(c.slaDueAt).toISOString(),
+        resolved_at: c.resolution && c.resolution.at ? new Date(c.resolution.at).toISOString() : '',
+        rating: (c.resolution && c.resolution.rating) || '', assigned_to: c.assignedTo || '', linked_to: c.linkedTo || ''
+      }));
+      if (Utils.downloadCSV('civicconnect-complaints-' + new Date().toISOString().slice(0, 10) + '.csv', rows)) Toast.show(t('toast.export', { n: rows.length }), 'ok');
+    });
+    const ab = Utils.$('#adminBrief');
+    if (ab) ab.addEventListener('click', () => {
+      const box = Utils.$('#adminBriefOut');
+      box.classList.remove('hide');
+      Utils.$('#adminBriefText').textContent = Services.summarizeForOfficials(Store.state.complaints.filter((c) => c.status !== 'Closed'), 'all departments');
+      Toast.show(t('toast.brief'), 'ok');
+    });
+  }
+  const update = () => render(Utils.$('#viewRoot'));
+  function destroy() { Charts.destroyAll(); }
+  return { id: 'admin', render, update, destroy };
+};
+
+/* ==========================================================================
+ * 19. VIEW: PUBLIC STATS — open data page for everyone
+ * ======================================================================== */
+const StatsView = () => {
+  function render(root) {
+    const m = Store.computeMetrics();
+    const hot = Store.hotspots(300).slice(0, 5);
+    root.innerHTML = `
+    <div class="wrap section" style="max-width:1100px">
+      <div class="between reveal">
+        <div><h2 style="margin-bottom:2px">${t('stats.title')}</h2><p class="muted mb0 small">${t('stats.sub')}</p></div>
+        <div class="row"><button class="btn" id="statsExport">${t('admin.export')}</button><a class="btn btn-primary" href="#/map">${t('nav.map')}</a></div>
+      </div>
+      <div class="grid g-4" style="margin-top:18px">
+        ${Components.kpi(t('stat.reports'), m.total, { color: '#22D3EE' })}
+        ${Components.kpi(t('stat.resolved'), m.resolvedCount, { color: '#34D399' })}
+        ${Components.kpi(t('stat.sla'), m.slaPct, { suffix: '%', color: '#A3E635' })}
+        ${Components.kpi(t('stat.rating'), Utils.round(m.avgRating, 1), { dec: 1, suffix: '/5', color: '#FBBF24' })}
+      </div>
+      <div class="grid g-2" style="margin-top:18px">
+        <section class="card glass reveal"><h3>${t('stats.byCat')}</h3>
+          <div class="stack" style="gap:10px">
+            ${m.byCategory.map((c) => `<div><div class="row between"><span class="small">${t('cat.' + c.cat)}</span><span class="tiny muted">${c.n}</span></div>
+              <span class="bar sm" style="display:block;margin-top:4px"><i style="width:${Utils.pct(c.n, m.total)}%;background:linear-gradient(90deg,${c.color},var(--aqua))"></i></span></div>`).join('')}
+          </div>
+        </section>
+        <section class="card glass reveal"><h3>${t('stats.byDept')}</h3>
+          <div class="table-wrap"><table><thead><tr><th>${t('off.title')}</th><th class="num">${t('stat.reports')}</th><th class="num">${t('stats.hours')}</th><th class="num">SLA</th></tr></thead>
+            <tbody>${m.byDept.map((d) => `<tr><td>${Utils.escapeHtml(d.name)}</td><td class="num">${d.total}</td><td class="num">${Utils.round(d.avgHours, 1)}</td><td class="num">${d.slaPct}%</td></tr>`).join('')}</tbody></table></div>
+        </section>
+        <section class="card glass reveal"><h3>${t('stats.trend')}</h3>
+          <div class="row" style="align-items:flex-end;gap:3px;height:150px" role="img" aria-label="${t('stats.trend')}">
+            ${m.trend.map((d) => `<span style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:2px" title="${Utils.fmtDay(d.date, Store.state.lang)}: ${d.filed} filed / ${d.closed} closed">
+              <i style="display:block;height:${(d.closed / Math.max(1, Math.max(...m.trend.map((x) => x.filed)))) * 100}%;background:var(--st-resolved);border-radius:3px"></i>
+              <i style="display:block;height:${(d.filed / Math.max(1, Math.max(...m.trend.map((x) => x.filed)))) * 100}%;background:linear-gradient(180deg,var(--violet),var(--aqua));border-radius:3px"></i>
+            </span>`).join('')}
+          </div>
+          <div class="row between tiny muted" style="margin-top:6px"><span>${Utils.fmtDay(m.trend[0].date, Store.state.lang)}</span><span>${Utils.fmtDay(m.trend[m.trend.length - 1].date, Store.state.lang)}</span></div>
+        </section>
+        <section class="card glass reveal"><h3>${t('admin.hotspots')}</h3>
+          <div class="stack" style="gap:10px">
+            ${hot.length ? hot.map((h, i) => `<div class="row between"><div class="row" style="gap:8px"><span class="chip">#${i + 1}</span>
+              <span class="small">${Utils.escapeHtml(h.area)}</span></div><span class="tiny muted">${h.count} · ${Math.round(h.score)}/100</span></div>`).join('') : `<p class="hint">${t('empty.title')}</p>`}
+          </div>
+          <hr class="hr" />
+          <div class="row between small"><span>${t('admin.affected')}</span><strong>${m.affected}</strong></div>
+          <div class="row between small"><span>${t('tab.overdue')}</span><strong>${m.overdue}</strong></div>
+          <div class="row between small"><span>${t('pri.dup')}</span><strong>${m.byColor.dup}</strong></div>
+        </section>
+      </div>
+    </div>`;
+    const ex = Utils.$('#statsExport');
+    if (ex) ex.addEventListener('click', () => {
+      const rows = Store.state.complaints.filter((c) => !c.removed).map((c) => ({ id: c.id, category: c.category, status: c.status, department: c.department, priority: c.priorityScore, created: new Date(c.createdAt).toISOString(), resolved: c.resolution && c.resolution.at ? new Date(c.resolution.at).toISOString() : '' }));
+      if (Utils.downloadCSV('civicconnect-public-stats.csv', rows)) Toast.show(t('toast.export', { n: rows.length }), 'ok');
+    });
+  }
+  return { id: 'stats', render };
+};

@@ -1,0 +1,534 @@
+/* ==========================================================================
+ * 20. ROUTER — hash based, with cross-fade + skeleton loader
+ * ======================================================================== */
+const Router = (() => {
+  let current = null, currentKey = '', lastFocusId = null;
+  const factories = {
+    '#/': () => LandingView(),
+    '#/report': () => ReportView(),
+    '#/map': () => MapView(),
+    '#/mine': () => MineView(),
+    '#/official': () => OfficialView(),
+    '#/admin': () => AdminView(),
+    '#/stats': () => StatsView(),
+    '#/auth': () => AuthView()
+  };
+  const DETAIL = '#/c/';
+  function parse() {
+    const hash = location.hash || '#/';
+    if (hash.startsWith(DETAIL)) return { key: hash, name: DETAIL, id: hash.slice(DETAIL.length) };
+    return { key: factories[hash] ? hash : '#/', name: factories[hash] ? hash : '#/' };
+  }
+  function skeleton() {
+    return `<div class="wrap section"><div class="skel skel-line" style="width:30%;height:22px"></div>
+      <div class="grid g-3" style="margin-top:16px">${Components.skeletonCards(3)}</div>
+      <div class="grid g-2" style="margin-top:16px">${Components.skeletonCards(2)}</div></div>`;
+  }
+  function mountView(view, rootEl) {
+    if (view.mount) view.mount();
+    Motion.viewEnter(rootEl);
+    const parsed = parse();
+    if (parsed.name === '#/' || parsed.name === '') {
+      const title = Utils.$('#heroTitle');
+      if (title) Motion.splitWords(title);
+      // wait for the intro curtain to lift before playing the hero sequence
+      const heroWhenReady = (tries) => {
+        if (Motion.reduced() || !Motion.hasGsap()) return;
+        if (document.getElementById('intro') && tries < 40) { setTimeout(() => heroWhenReady(tries + 1), 200); return; }
+        Motion.heroIn();
+      };
+      setTimeout(() => heroWhenReady(0), 60);
+      Motion.scrollScenes('#/');
+    }
+    if (parsed.name === '#/admin' || parsed.name === '#/stats') Motion.scrollScenes(parsed.name);
+    // Deep-link behaviour: open the requested ticket and scroll to it.
+    if (view.id && view.id.indexOf('detail:') === 0) window.scrollTo({ top: 0, behavior: Motion.reduced() ? 'auto' : 'smooth' });
+  }
+  function render(force) {
+    const root = Utils.$('#viewRoot');
+    if (!root) return;
+    const parsed = parse();
+    const view = parsed.id ? DetailView(parsed.id) : factories[parsed.name]();
+    const sameKey = parsed.key === currentKey;
+    if (sameKey && !force && current && current.update) { current.update(); return; }
+    if (current && current.destroy) { try { current.destroy(); } catch (e) { /* view cleanup is best-effort */ } }
+    Charts.destroyAll();
+    current = view; currentKey = parsed.key;
+    // Fade out, swap, fade in (skeleton keeps the layout stable while heavy views build).
+    root.classList.add('view-out');
+    const heavy = ['#/map', '#/official', '#/admin', '#/'].includes(parsed.name);
+    const swap = () => {
+      if (heavy && !Motion.reduced()) {
+        root.innerHTML = skeleton();
+        root.classList.remove('view-out');
+        setTimeout(() => { view.render(root); mountView(view, root); }, 220);
+      } else {
+        view.render(root); root.classList.remove('view-out'); mountView(view, root);
+      }
+    };
+    Motion.reduced() ? swap() : setTimeout(swap, 120);
+    try { history.replaceState(null, '', parsed.key); } catch (e) { /* file:// history is fine to skip */ }
+    lastFocusId = parsed.id || null;
+  }
+  /** Patch the current view after a data change instead of rebuilding everything. */
+  function refresh() { render(false); }
+  function go(hash) {
+    if (!hash) return;
+    if (location.hash === hash) { render(true); return; }
+    location.hash = hash;   // triggers hashchange → render
+  }
+  return { render, refresh, go, parse, get current() { return current; }, get focusId() { return lastFocusId; } };
+})();
+
+/* ==========================================================================
+ * 21. APP — nav, theme, language, accessibility, notifications, delegation
+ * ======================================================================== */
+const App = (() => {
+  /* ---------- theme with circular clip-path reveal ---------- */
+  function setTheme(next, animate = true) {
+    const root = document.documentElement;
+    const btn = Utils.$('#themeBtn');
+    const apply = () => {
+      root.setAttribute('data-theme', next);
+      Store.state.theme = next;
+      Utils.storage.set('cc.theme', next);
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', next === 'dark' ? '#0B1026' : '#F2F5FD');
+      if (btn) {
+        btn.innerHTML = `<svg width="20" height="20" aria-hidden="true"><use href="#i-${next === 'dark' ? 'sun' : 'moon'}"/></svg>`;
+        btn.setAttribute('aria-label', next === 'dark' ? t('nav.theme') : t('nav.theme'));
+      }
+      Charts.destroyAll();
+      if (Router.current && Router.current.update) Router.current.update();
+    };
+    if (animate && !Motion.reduced()) {
+      const r = btn ? btn.getBoundingClientRect() : { left: window.innerWidth - 60, top: 30, width: 40, height: 40 };
+      const clip = document.createElement('div');
+      clip.style.cssText = `position:fixed;left:${r.left + r.width / 2}px;top:${r.top + r.height / 2}px;width:10px;height:10px;border-radius:50%;z-index:399;pointer-events:none;transform:translate(-50%,-50%) scale(0);background:${next === 'dark' ? '#0B1026' : '#F2F5FD'};opacity:.96`;
+      document.body.appendChild(clip);
+      clip.animate([{ transform: 'translate(-50%,-50%) scale(0)' }, { transform: `translate(-50%,-50%) scale(${Math.hypot(window.innerWidth, window.innerHeight) / 5})` }], { duration: 420, easing: 'cubic-bezier(.22,1,.36,1)' })
+        .onfinish = () => { apply(); clip.animate([{ opacity: .96 }, { opacity: 0 }], { duration: 260, easing: 'ease-out' }).onfinish = () => clip.remove(); };
+      setTimeout(() => { if (document.body.contains(clip)) { clip.remove(); } }, 900);
+    } else apply();
+  }
+  /* ---------- language ---------- */
+  function setLang(lang) {
+    Store.state.lang = lang;
+    document.documentElement.setAttribute('lang', lang === 'ta' ? 'ta' : 'en');
+    Utils.storage.set('cc.lang', lang);
+    renderChrome(); Router.render(true);
+    Toast.show(lang === 'ta' ? 'மொழி: தமிழ்' : 'Language: English', 'info');
+  }
+  /* ---------- accessibility prefs ---------- */
+  function setPrefs(partial) {
+    Object.assign(Store.state.prefs, partial);
+    const root = document.documentElement;
+    root.classList.toggle('a11y-large', Store.state.prefs.large);
+    root.classList.toggle('a11y-contrast', Store.state.prefs.contrast);
+    root.classList.toggle('a11y-reduce', Store.state.prefs.reduce);
+    root.classList.toggle('lowbw', Store.state.prefs.lowbw);
+    root.classList.toggle('reduced', Motion.reduced());
+    Utils.storage.set('cc.prefs', Store.state.prefs);
+    renderChrome();
+    Router.render(true);
+  }
+  function resetPrefs() { setPrefs({ large: false, contrast: false, reduce: false, lowbw: false }); Toast.show(t('a11y.reset'), 'ok'); }
+  /* ---------- segmented control with animated pill ---------- */
+  function segment(container, items, activeKey, onPick, label) {
+    container.setAttribute('aria-label', label || '');
+    container.innerHTML = items.map(([k, lbl]) => `<button data-key="${k}" aria-pressed="${k === activeKey}">${lbl}</button>`).join('') + '<span class="pill" aria-hidden="true"></span>';
+    const pills = container.querySelector('.pill');
+    const sync = () => {
+      const active = container.querySelector('[aria-pressed="true"]');
+      if (!active || !pills) return;
+      pills.style.width = active.offsetWidth + 'px';
+      pills.style.transform = `translateX(${active.offsetLeft - 3}px)`;
+      pills.style.opacity = active ? 1 : 0;
+    };
+    Utils.$$('button', container).forEach((b) => b.addEventListener('click', () => {
+      Utils.$$('button', container).forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      sync(); onPick(b.dataset.key);
+    }));
+    requestAnimationFrame(sync);
+    setTimeout(sync, 260);
+    window.addEventListener('resize', Utils.debounce(sync, 160));
+    return sync;
+  }
+  /* ---------- nav + panels ---------- */
+  function navLinks() {
+    const role = Store.state.role;
+    const links = [['#/', t('nav.landing')], ['#/map', t('nav.map')], ['#/report', t('nav.report')]];
+    if (!Store.isGuest()) links.push(['#/mine', t('nav.mine')]);
+    if (!Store.isGuest() && (role === 'official' || role === 'admin')) links.push(['#/official', t('nav.official')]);
+    if (!Store.isGuest() && role === 'admin') links.push(['#/admin', t('nav.admin')]);
+    links.push(['#/stats', t('nav.stats')]);
+    if (Store.isGuest()) links.push(['#/auth', t('nav.auth')]);
+    return links;
+  }
+  /** Translate static markup (nav tagline, footer, demo button) on every language switch. */
+  function applyStaticI18n() {
+    const demoRunning = Utils.$('#demoCaption') && Utils.$('#demoCaption').classList.contains('show');
+    Utils.$$('[data-i18n]').forEach((el) => {
+      const key = el.dataset.i18n;
+      if (key === 'demo.play' && demoRunning) return;      // demo controller owns this label while running
+      const value = t(key);
+      if (value && value !== key) el.textContent = value;
+    });
+  }
+  function renderChrome() {
+    applyStaticI18n();
+    // Nav links
+    const nl = Utils.$('#navLinks');
+    const active = Router.parse().name;
+    nl.innerHTML = navLinks().map(([h, l]) => `<a class="nav-link" href="${h}" aria-current="${h === active ? 'page' : 'false'}">${l}</a>`).join('');
+    // Role switch
+    const roleItems = [['citizen', t('role.citizen')], ['official', t('role.official')], ['admin', t('role.admin')]];
+    segment(Utils.$('#roleSwitch'), roleItems, Store.state.role, (role) => {
+      if (Store.isGuest()) { Store.Auth.switchRole(role); }
+      else if (Store.me().role !== role) Store.Auth.switchRole(role);
+      const home = role === 'admin' ? '#/admin' : role === 'official' ? '#/official' : '#/mine';
+      Router.go(home);
+    }, t('role.citizen'));
+    // Language switch
+    segment(Utils.$('#langSwitch'), [['en', 'EN'], ['ta', 'தமிழ்']], Store.state.lang, setLang, 'Language');
+    // Theme button icon
+    const btn = Utils.$('#themeBtn');
+    btn.innerHTML = `<svg width="20" height="20" aria-hidden="true"><use href="#i-${Store.state.theme === 'dark' ? 'sun' : 'moon'}"/></svg>`;
+    // Bell
+    const unread = Store.unreadCount();
+    const dot = Utils.$('#bellDot');
+    dot.textContent = unread > 99 ? '99+' : String(unread);
+    dot.classList.toggle('hide', unread === 0);
+    Utils.$('#bellBtn').setAttribute('aria-label', `${t('nav.notifications')} (${unread})`);
+    // Sign out shortcut when signed in
+    const nav = Utils.$('.nav .row');
+    const existing = Utils.$('#signOutBtn');
+    if (!Store.isGuest() && !existing && nav) {
+      const b = document.createElement('button');
+      b.className = 'icon-btn'; b.id = 'signOutBtn'; b.title = t('auth.logout');
+      b.setAttribute('aria-label', t('auth.logout'));
+      b.innerHTML = `<svg width="18" height="18" aria-hidden="true"><use href="#i-staff"/></svg>`;
+      b.addEventListener('click', () => { Store.Auth.logout(); Router.go('#/'); });
+      nav.insertBefore(b, Utils.$('#themeBtn'));
+    } else if (Store.isGuest() && existing) existing.remove();
+  }
+  function relevantNotifications() {
+    const me = Store.me();
+    return Store.state.notifications.filter((n) => {
+      if (!n.audience) return true;
+      if (n.audience === 'admin') return Store.state.role === 'admin';
+      if (n.audience === 'official') return Store.state.role === 'official' ? (!me || !me.department || !n.dept || n.dept === me.department) : Store.state.role === 'admin';
+      return !n.userId || (me && n.userId === me.id);
+    });
+  }
+  function renderNotifications() {
+    const panel = Utils.$('#notifPanel');
+    const list = relevantNotifications();
+    panel.innerHTML = `
+      <div class="row between" style="padding:6px 8px">
+        <strong>${t('nav.notifications')}</strong>
+        <button class="btn btn-xs btn-ghost" id="markRead">✓ ${t('status.Closed')}</button>
+      </div>
+      <div>
+        ${list.length ? list.map((n) => `<div class="notif ${n.read ? '' : 'unread'}">
+          <span class="ico" aria-hidden="true"><svg width="15" height="15"><use href="#i-${n.kind === 'resolve' ? 'check' : n.kind === 'merge' ? 'link' : n.kind === 'comment' ? 'comment' : n.kind === 'flag' ? 'flag' : 'bell'}"/></svg></span>
+          <div class="grow"><div class="small" style="font-weight:600">${Utils.escapeHtml(n.title)}</div>
+          <div class="tiny muted">${Utils.escapeHtml(n.body || '')}</div>
+          <div class="tiny muted" style="margin-top:2px">${Utils.ago(n.at, Store.state.lang)}${n.complaintId ? ` · <a href="#/c/${n.complaintId}">${n.complaintId}</a>` : ''}</div></div>
+        </div>`).join('') : `<p class="hint" style="padding:10px">${t('empty.title')}</p>`}
+      </div>`;
+    const mr = Utils.$('#markRead', panel);
+    if (mr) mr.addEventListener('click', () => { Store.markAllRead(); renderChrome(); renderNotifications(); });
+    Utils.$$('a[href^="#/c/"]', panel).forEach((a) => a.addEventListener('click', () => togglePanel('notifPanel', false)));
+  }
+  function renderA11yPanel() {
+    const p = Store.state.prefs;
+    const panel = Utils.$('#a11yPanel');
+    panel.innerHTML = `
+      <strong style="display:block;padding:6px 8px">${t('a11y.title')}</strong>
+      <label class="switch" style="padding:8px;display:flex"><input type="checkbox" id="pLarge" ${p.large ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('a11y.large')}</span></label>
+      <label class="switch" style="padding:8px;display:flex"><input type="checkbox" id="pContrast" ${p.contrast ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('a11y.contrast')}</span></label>
+      <label class="switch" style="padding:8px;display:flex"><input type="checkbox" id="pReduce" ${p.reduce ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('a11y.reduce')}</span></label>
+      <label class="switch" style="padding:8px;display:flex"><input type="checkbox" id="pLowbw" ${p.lowbw ? 'checked' : ''} /><span class="track" aria-hidden="true"></span><span>${t('a11y.lowbw')}</span></label>
+      <div class="row" style="padding:8px;gap:8px">
+        <button class="btn btn-sm" id="pReset">${t('a11y.reset')}</button>
+        <button class="btn btn-sm btn-primary" id="pClose">${t('action.done')}</button>
+      </div>`;
+    const bind = (id, key) => { const el = Utils.$('#' + id, panel); if (el) el.addEventListener('change', () => setPrefs({ [key]: el.checked })); };
+    bind('pLarge', 'large'); bind('pContrast', 'contrast'); bind('pReduce', 'reduce'); bind('pLowbw', 'lowbw');
+    Utils.$('#pReset', panel).addEventListener('click', resetPrefs);
+    Utils.$('#pClose', panel).addEventListener('click', () => togglePanel('a11yPanel', false));
+  }
+  function togglePanel(id, force) {
+    ['notifPanel', 'a11yPanel'].forEach((pid) => {
+      const el = Utils.$('#' + pid);
+      const open = pid === id ? (force != null ? force : el.classList.contains('hide')) : false;
+      el.classList.toggle('hide', !open);
+      el.hidden = !open;
+    });
+    const bell = Utils.$('#bellBtn'), acc = Utils.$('#a11yBtn');
+    if (bell) bell.setAttribute('aria-expanded', String(id === 'notifPanel' && !Utils.$('#notifPanel').classList.contains('hide')));
+    if (acc) acc.setAttribute('aria-expanded', String(id === 'a11yPanel' && !Utils.$('#a11yPanel').classList.contains('hide')));
+    if (id === 'notifPanel' && !Utils.$('#notifPanel').classList.contains('hide')) renderNotifications();
+  }
+  /* ---------- global delegated interactions ---------- */
+  const pendingLocation = { value: null };     // map → report wizard handoff
+  function delegate() {
+    document.addEventListener('click', async (e) => {
+      const reportHere = e.target.closest('[data-report-here]');
+      if (reportHere) {
+        const [lat, lng] = reportHere.dataset.reportHere.split(',').map(Number);
+        if (Number.isFinite(lat) && Number.isFinite(lng)) {
+          pendingLocation.value = { lat, lng };
+          Toast.show(t('map.pinSet'), 'info');
+          Router.go('#/report');
+        }
+        return;
+      }
+      const openEl = e.target.closest('[data-open]');
+      const up = e.target.closest('[data-upvote]');
+      const fol = e.target.closest('[data-follow]');
+      const share = e.target.closest('[data-share]');
+      const flag = e.target.closest('[data-flag]');
+      if (up) {
+        e.stopPropagation();
+        const id = up.dataset.upvote;
+        const added = Actions.upvote(id);
+        const r = up.getBoundingClientRect();
+        if (added) Motion.upvoteBurst(r.left + r.width / 2, r.top + r.height / 2);
+        up.classList.add('burst'); setTimeout(() => up.classList.remove('burst'), 520);
+        setTimeout(() => Router.refresh(), 80);
+        return;
+      }
+      if (fol) {
+        e.stopPropagation();
+        const id = fol.dataset.follow;
+        const on = Actions.follow(id);
+        fol.classList.toggle('btn-lime', !!on);
+        fol.innerHTML = `<svg width="15" height="15" aria-hidden="true"><use href="#i-heart${on ? '-fill' : ''}"/></svg>${on ? t('detail.following') : t('detail.follow')}`;
+        Motion.Confetti.fromElement(fol, 0.35);
+        return;
+      }
+      if (share) {
+        e.stopPropagation();
+        const url = location.origin + location.pathname + '#/c/' + share.dataset.share;
+        try { await navigator.clipboard.writeText(url); Toast.show(t('toast.copied'), 'ok'); }
+        catch (err) { Toast.show(t('toast.copiedFail'), 'warn'); }
+        return;
+      }
+      if (flag) {
+        e.stopPropagation();
+        const id = flag.dataset.flag;
+        Modal.open({
+          title: t('detail.report'), subtitle: id,
+          body: `<label for="flagReason">${t('detail.addComment')}</label><textarea class="textarea" id="flagReason" placeholder="${Utils.escapeHtml(t('detail.commentPh'))}" data-autofocus></textarea>`,
+          actions: [{ id: 'cancel', label: t('form.back'), class: 'btn-ghost' },
+            { id: 'ok', label: t('detail.report'), class: 'btn-coral', onClick: () => { Actions.flag(id, document.getElementById('flagReason').value.trim() || 'Flagged by a user'); Router.refresh(); return true; } }]
+        });
+        return;
+      }
+      if (openEl) {
+        const id = openEl.dataset.open;
+        const src = e.target.closest('.c-card, .kcard, tr');
+        Motion.flipFrom(src, () => Router.go('#/c/' + id));
+        return;
+      }
+      // close dropdowns when clicking outside the header
+      if (!e.target.closest('.nav')) togglePanel(null, false);
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { togglePanel(null, false); Modal.close(); }
+      if (e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)) {
+        const s = Utils.$('#mapSearch'); if (s) { e.preventDefault(); s.focus(); }
+      }
+    });
+    window.addEventListener('hashchange', () => Router.render(false));
+  }
+  /* ---------- init ---------- */
+  function init() {
+    // restore prefs (never throws — storage helper degrades)
+    const savedTheme = Utils.storage.get('cc.theme', 'dark');
+    const savedLang = Utils.storage.get('cc.lang', 'en');
+    const savedPrefs = Utils.storage.get('cc.prefs', null);
+    Store.state.theme = savedTheme === 'light' ? 'light' : 'dark';
+    Store.state.lang = savedLang === 'ta' ? 'ta' : 'en';
+    if (savedPrefs && typeof savedPrefs === 'object') Object.assign(Store.state.prefs, savedPrefs);
+    document.documentElement.setAttribute('data-theme', Store.state.theme);
+    document.documentElement.setAttribute('lang', Store.state.lang === 'ta' ? 'ta' : 'en');
+    document.documentElement.classList.toggle('a11y-large', !!Store.state.prefs.large);
+    document.documentElement.classList.toggle('a11y-contrast', !!Store.state.prefs.contrast);
+    document.documentElement.classList.toggle('a11y-reduce', !!Store.state.prefs.reduce);
+    document.documentElement.classList.toggle('lowbw', !!Store.state.prefs.lowbw);
+    document.documentElement.classList.toggle('reduced', Motion.reduced());
+
+    // seed the world, then wire everything
+    Store.loadSeed();
+    Motion.init();
+    delegate();
+    Utils.$('#themeBtn').addEventListener('click', () => setTheme(Store.state.theme === 'dark' ? 'light' : 'dark'));
+    Utils.$('#bellBtn').addEventListener('click', (e) => { e.stopPropagation(); togglePanel('notifPanel'); });
+    Utils.$('#a11yBtn').addEventListener('click', (e) => { e.stopPropagation(); togglePanel('a11yPanel'); });
+    Utils.$('#demoFab').addEventListener('click', () => Demo.start());
+    Utils.$('#demoSkip').addEventListener('click', () => Demo.stop());
+    renderChrome();
+    renderA11yPanel();
+    Router.render(true);
+    // keep chrome in sync with any state change
+    Store.subscribe(() => { renderChrome(); if (Demo.state.running) return; });
+    // Refresh the visible view when data changes (patched, not rebuilt, where possible)
+    Store.subscribe((S, evt) => {
+      if (Demo.state.running || evt === 'auth') return;
+      if (['complaint:update', 'complaint:add', 'notifications', 'admin:update'].includes(evt)) Router.refresh();
+    });
+    // First-run hint
+    setTimeout(() => Toast.show(t('auth.roleLocked'), 'info', { ms: 5600 }), 1400);
+  }
+  return { init, setTheme, setLang, setPrefs, resetPrefs, renderChrome, togglePanel, get prefs() { return Store.state.prefs; },
+    /** Consumed once by the report wizard when it is opened from the map. */
+    takePendingLocation() { const v = pendingLocation.value; pendingLocation.value = null; return v; } };
+})();
+
+/* ==========================================================================
+ * 22. GUIDED DEMO — playwright-style walkthrough of the full lifecycle
+ * ======================================================================== */
+const Demo = (() => {
+  const state = { running: false, aborted: false, step: 0, total: 8 };
+  const wait = (ms) => new Promise((r) => setTimeout(r, Motion.reduced() ? Math.min(ms, 340) : ms));
+  const caption = (label, text, pct) => {
+    const box = Utils.$('#demoCaption');
+    Utils.$('#demoStepLabel').textContent = label;
+    Utils.$('#demoText').textContent = text;
+    Utils.$('#demoBar').style.width = pct + '%';
+    box.classList.remove('hide');
+    box.classList.add('show');
+  };
+  const asRole = async (role, fn) => {
+    const prevRole = Store.state.role, prevUser = Store.state.userId;
+    Store.state.role = role;
+    if (role === 'official') {
+      const dept = ReportApi && ReportApi.draft && ReportApi.analysis ? ReportApi.analysis.department : null;
+      const off = Store.state.users.find((u) => u.role === 'official' && (!dept || u.department === dept)) || Store.state.users.find((u) => u.role === 'official');
+      if (off) Store.state.userId = off.id;
+    }
+    await fn();
+    Store.state.role = prevRole; Store.state.userId = prevUser;
+    Store.emit('auth');
+  };
+  const skip = () => state.aborted;
+  const guard = () => new Promise((r) => setTimeout(r, 0)).then(() => !state.aborted);
+
+  async function start() {
+    if (state.running) { stop(); return; }
+    state.running = true; state.aborted = false; state.step = 0;
+    Utils.$('#demoFab').querySelector('span:last-child').textContent = t('demo.stop');
+    try {
+      /* 1 — identity */
+      caption('1 / 8', Store.state.lang === 'ta' ? 'பிரியா, தாம்பரம் மேற்கு பகுதியைச் சேர்ந்த குடிமகன் — ஒரு குழியைப் பார்க்கிறார்.' : 'Meet Priya, a citizen in West Tambaram. She spots a pothole at the college gate.', 12);
+      Store.state.userId = 'u-cit-1'; Store.state.role = 'citizen'; Store.emit('auth');
+      Router.go('#/'); window.scrollTo({ top: 0, behavior: 'smooth' });
+      await wait(2000); if (skip()) return finish(true);
+
+      /* 2 — open the wizard and type the report */
+      caption('2 / 8', 'She opens the report wizard and describes the issue — no dropdown hunting, no forms in triplicate.', 26);
+      Router.go('#/report'); await wait(1300); if (skip()) return finish(true);
+      if (ReportApi) {
+        ReportApi.gotoStep(0); await wait(500);
+        ReportApi.set('Hazardous pothole outside Madras Christian College west gate',
+          'A deep pothole right outside the college west gate where hundreds of students cycle. It fills with water in rain and two-wheelers swerve into traffic. Very dangerous near the school entrance.',
+          'road damage', 'Madras Christian College west gate, Tambaram');
+        ReportApi.setPoint(12.91888, 80.12132);
+        await wait(900);
+        ReportApi.simulateMedia();
+      }
+      await wait(1600); if (skip()) return finish(true);
+
+      /* 3 — AI triage */
+      caption('3 / 8', 'AI triage runs on-device: category, severity, sentiment, department and an explainable priority score.', 38);
+      if (ReportApi) ReportApi.analyze();
+      Motion.Confetti.burst(0.3, { x: 0.5, y: 0.3 });
+      await wait(2100); if (skip()) return finish(true);
+
+      /* 4 — duplicate radar */
+      caption('4 / 8', 'The duplicate radar fires: an almost identical report already exists 41 m away.', 50);
+      if (ReportApi) ReportApi.gotoStep(4);
+      await wait(1900); if (skip()) return finish(true);
+      const dupText = ReportApi && ReportApi.duplicateTitle ? ReportApi.duplicateTitle() : '';
+      caption('4 / 8', dupText ? `Match found: “${Utils.truncate(dupText, 58)}”. We submit anyway to show the full lifecycle (in real use “Support this report” merges the vote instead).` : 'No match this time — the ticket is filed as a fresh issue.', 56);
+      if (ReportApi) ReportApi.submitInstead(false);
+      const newId = Store.state.complaints[0].id;
+      await wait(2200); if (skip()) return finish(true);
+
+      /* 5 — routing */
+      caption('5 / 8', `Routed automatically to ${Store.complaint(newId).department} with an SLA clock of ${Store.categoryMeta(Store.complaint(newId).category).slaHours} hours.`, 66);
+      Router.go('#/c/' + newId); await wait(1700); if (skip()) return finish(true);
+
+      /* 6 — department works the ticket */
+      caption('6 / 8', 'The department moves it Verified → Assigned → In Progress. Every transition is logged in the audit trail.', 76);
+      await asRole('official', async () => {
+        Actions.transition(newId, 'Verified', { by: 'official', note: 'Verified on site by the ward inspector' });
+        await wait(900);
+        Store.complaint(newId).assignedTo = (STAFF[Store.complaint(newId).department] || ['Field crew'])[0];
+        Actions.transition(newId, 'Assigned', { by: 'official', note: 'Assigned to ' + Store.complaint(newId).assignedTo });
+        await wait(900);
+        Actions.transition(newId, 'In Progress', { by: 'official', note: 'Bitumen crew on site, work started' });
+      });
+      Router.refresh();
+      await wait(1500); if (skip()) return finish(true);
+
+      /* 7 — proof upload (evidence-gated closure) */
+      caption('7 / 8', 'Resolution needs proof: an after-photo plus a note. The state machine blocks closure without it.', 86);
+      await asRole('official', async () => {
+        Actions.resolve(newId, { afterPhoto: Utils.placeholderImage(newId + '-demo-after', 'repaired surface'), note: 'Pothole filled with bitumen, surface levelled and compacted. Area cleaned and handed back to traffic.' });
+      });
+      Router.refresh();
+      await wait(1900); if (skip()) return finish(true);
+
+      /* 8 — citizen confirms → green on the map */
+      caption('8 / 8', 'Priya confirms the fix and rates the response. The ticket closes — and turns green on the public map.', 94);
+      await wait(900);
+      if (Actions.confirmFix(newId)) Motion.Confetti.burst(1.6);
+      await asRole('citizen', async () => { Actions.rate(newId, 5); });
+      Router.go('#/map');
+      await wait(1400);
+      caption('Done', t('toast.demoDone'), 100);
+      await wait(2600);
+      if (!Motion.reduced()) { Router.go('#/c/' + newId); }
+      finish(false);
+    } catch (err) {
+      console.warn('Guided demo stopped', err);
+      Toast.show(t('err.generic'), 'warn');
+      finish(true);
+    }
+  }
+  function finish(abortedRun) {
+    state.running = false; state.aborted = true;
+    const fab = Utils.$('#demoFab');
+    if (fab) fab.querySelector('span:last-child').textContent = t('demo.play');
+    const box = Utils.$('#demoCaption');
+    if (box) { box.classList.remove('show'); setTimeout(() => box.classList.add('hide'), 500); }
+    if (!abortedRun) Toast.show(t('toast.demoDone'), 'ok');
+  }
+  function stop() { finish(true); Toast.show(t('demo.stop'), 'info'); }
+  return { start, stop, state };
+})();
+
+/* ==========================================================================
+ * 23. BOOT
+ * ======================================================================== */
+(function boot() {
+  const start = () => {
+    try { App.init(); }
+    catch (err) {
+      console.error('CivicConnect failed to start:', err);
+      const root = document.getElementById('viewRoot');
+      if (root) root.innerHTML = `<div class="wrap section"><div class="empty"><h3>${t('err.generic')}</h3>
+        <p class="muted small">CivicConnect could not start in this browser. Reload the page to try again.</p>
+        <button class="btn btn-primary" onclick="location.reload()">Reload</button></div></div>`;
+    }
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+</body>
+</html>

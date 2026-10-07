@@ -1,0 +1,479 @@
+<script>
+/* ============================================================================
+ * CivicConnect — AI-assisted civic issue reporting (single-file demo)
+ * ----------------------------------------------------------------------------
+ * WHAT'S INSIDE
+ *   • Store ......... single in-memory state + pub/sub render loop (localStorage optional)
+ *   • Services ...... classifyCategory, estimateSeverity, sentimentScore, moderate,
+ *                     detectDuplicates (TF-IDF cosine + Haversine decay), priorityScore,
+ *                     summarizeForOfficials, Notifications, RBAC guards
+ *   • Views ......... Landing, Report wizard, Live Map, Detail, Citizen/Official/Admin dashboards
+ *   • Motion ........ intro draw-in, GSAP reveals + pinned how-it-works, 3D tilt, confetti,
+ *                     FLIP detail open, radar sweep, comparison slider, guided demo
+ *   • i18n .......... full EN / தமிழ் dictionary (labels, statuses, toasts, demo captions)
+ *   • A11y .......... large UI, high contrast, reduced motion, low-bandwidth text-only mode
+ *
+ * HOW TO SWAP IN A REAL BACKEND (FastAPI + Supabase + Gemini)
+ *   1. Auth ............ replace AuthService.login/register with supabase.auth.signInWithPassword()
+ *                        and insert a row in `profiles (id, role, department_id, name)`.
+ *   2. classifyCategory -> POST /v1/classify        (FastAPI + Gemini 1.5 Flash, Tamil+English prompt)
+ *   3. estimateSeverity -> POST /v1/severity        (Gemini function-calling w/ POI context)
+ *   4. sentimentScore   -> POST /v1/sentiment       (sentence-transformers / IndicBERT head)
+ *   5. moderate         -> POST /v1/moderate        (Perspective-style classifier + spam rules)
+ *   6. detectDuplicates -> POST /v1/duplicates      (pgvector/sentence-transformers embedding +
+ *                        PostGIS: ST_DWithin(geog, point, 150) in `complaints`)
+ *   7. priorityScore    -> POST /v1/priority        (same weights; POIs from a `pois` table)
+ *   8. summarizeForOfficials -> POST /v1/summary    (Gemini on the filtered complaint rows)
+ *   9. Media            -> supabase.storage.from('complaint-media').upload() → store public URL
+ *  10. Realtime         -> supabase.channel('complaints').on('postgres_changes', ...) replaces Notify.push
+ *  11. SLA/cron         -> pg_cron job marks overdue; status machine enforced by a Postgres trigger.
+ *  Every service below is a pure function returning a plain object: swap the body, keep the shape.
+ * ========================================================================== */
+
+/* ==========================================================================
+ * 0. UTILS
+ * ======================================================================== */
+const Utils = (() => {
+  /** Query helper. */
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  /** Safe localStorage: never throws, degrades to a no-op store. */
+  const storage = {
+    get(key, fallback = null) {
+      try { const raw = window.localStorage.getItem(key); return raw == null ? fallback : JSON.parse(raw); }
+      catch (e) { return fallback; }
+    },
+    set(key, value) {
+      try { window.localStorage.setItem(key, JSON.stringify(value)); return true; }
+      catch (e) { return false; }
+    }
+  };
+
+  const uid = (prefix = 'id') => prefix + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+  const round = (n, d = 1) => Math.round(n * Math.pow(10, d)) / Math.pow(10, d);
+  const escapeHtml = (s = '') => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const debounce = (fn, ms = 220) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+  const throttle = (fn, ms = 60) => { let last = 0, raf = 0; return (...a) => { const now = performance.now(); if (now - last < ms) return; last = now; cancelAnimationFrame(raf); raf = requestAnimationFrame(() => fn(...a)); }; };
+
+  /** Dates */
+  const now = () => Date.now();
+  const addHours = (ts, h) => ts + h * 3600 * 1000;
+  const fmtDate = (ts, lang = 'en') => new Date(ts).toLocaleString(lang === 'ta' ? 'ta-IN' : 'en-IN', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const fmtDay = (ts, lang = 'en') => new Date(ts).toLocaleDateString(lang === 'ta' ? 'ta-IN' : 'en-IN', { day: '2-digit', month: 'short' });
+  const ago = (ts, lang = 'en') => {
+    const s = Math.max(1, Math.floor((now() - ts) / 1000));
+    const units = lang === 'ta'
+      ? [[31536000, 'ஆண்டு'], [2592000, 'மாதம்'], [86400, 'நாள்'], [3600, 'மணி'], [60, 'நிமிடம்'], [1, 'வினாடி']]
+      : [[31536000, 'y'], [2592000, 'mo'], [86400, 'd'], [3600, 'h'], [60, 'm'], [1, 's']];
+    for (const [secs, label] of units) if (s >= secs) return Math.floor(s / secs) + (lang === 'ta' ? ' ' + label + ' முன்' : label);
+    return 'now';
+  };
+  const hoursLeft = (due) => Math.round((due - now()) / 36e5);
+
+  /** Geo — Haversine distance in metres. */
+  function haversine(a, b) {
+    if (!a || !b) return Infinity;
+    const R = 6371000, toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(b.lat - a.lat), dLng = toRad(b.lng - a.lng);
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+  }
+  const fmtDist = (m) => (m < 950 ? Math.round(m / 10) * 10 + ' m' : round(m / 1000, 1) + ' km');
+
+  /** Text */
+  const tokenize = (text) => String(text || '').toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ').split(/\s+/).filter(Boolean);
+  const truncate = (s, n = 90) => (String(s || '').length > n ? String(s).slice(0, n - 1).trimEnd() + '…' : String(s || ''));
+  const initials = (name = '?') => name.trim().split(/\s+/).slice(0, 2).map((w) => w[0]).join('').toUpperCase();
+  const hashHue = (str = '') => { let h = 0; for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) % 360; return h; };
+  const colorFor = (str) => `linear-gradient(135deg,hsl(${hashHue(str)} 70% 52%),hsl(${(hashHue(str) + 48) % 360} 72% 44%))`;
+
+  /** Inline SVG placeholder artwork — keeps the app image-free but never empty. */
+  function placeholderImage(seed = 'civic', label = '') {
+    const hue = hashHue(seed);
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="420" viewBox="0 0 640 420">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="hsl(${hue} 72% 26%)"/><stop offset=".55" stop-color="hsl(${(hue + 46) % 360} 68% 34%)"/>
+        <stop offset="1" stop-color="hsl(${(hue + 96) % 360} 66% 22%)"/></linearGradient>
+        <linearGradient id="s" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="rgba(255,255,255,.22)"/><stop offset="1" stop-color="rgba(255,255,255,0)"/></linearGradient>
+      </defs>
+      <rect width="640" height="420" fill="url(#g)"/>
+      <circle cx="132" cy="96" r="76" fill="rgba(255,255,255,.10)"/>
+      <circle cx="540" cy="330" r="120" fill="rgba(255,255,255,.07)"/>
+      <path d="M0 320 Q160 244 320 316 T640 300 V420 H0Z" fill="rgba(0,0,0,.32)"/>
+      <path d="M0 356 Q200 300 380 356 T640 344 V420 H0Z" fill="rgba(0,0,0,.45)"/>
+      <rect x="0" y="0" width="640" height="420" fill="url(#s)"/>
+      <text x="36" y="392" font-family="Sora,Inter,sans-serif" font-size="26" font-weight="700" fill="rgba(255,255,255,.78)">${Utils.escapeHtml(label).slice(0, 34)}</text>
+    </svg>`;
+    return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  }
+
+  /** Canvas downscale for uploads (max edge 1280, JPEG q0.72) — keeps memory sane. */
+  function downscaleImage(file, maxEdge = 1280, quality = 0.72) {
+    return new Promise((resolve) => {
+      if (!file || !/^image\//.test(file.type)) { resolve(null); return; }
+      const reader = new FileReader();
+      reader.onerror = () => resolve(null);
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => resolve(null);
+        img.onload = () => {
+          try {
+            const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+            const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
+            const c = document.createElement('canvas'); c.width = w; c.height = h;
+            const ctx = c.getContext('2d'); ctx.drawImage(img, 0, 0, w, h);
+            resolve(c.toDataURL('image/jpeg', quality));
+          } catch (e) { resolve(reader.result); }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  function readVideo(file) {
+    return new Promise((resolve) => {
+      if (!file) { resolve(null); return; }
+      const r = new FileReader();
+      r.onerror = () => resolve(null);
+      r.onload = () => resolve(r.result);
+      r.readAsDataURL(file);
+    });
+  }
+
+  /** DOM/format bits used by every view. */
+  const statusClass = (c) => Store.statusColorKey(c);
+  const pct = (n, total) => (total ? Math.round((n / total) * 100) : 0);
+
+  /** Accessible modal focus trap. */
+  function trapFocus(container, event) {
+    const focusables = $$('button,[href],input,select,textarea,[tabindex]:not([tabindex="-1"])', container)
+      .filter((el) => !el.disabled && el.offsetParent !== null);
+    if (!focusables.length) return;
+    const first = focusables[0], last = focusables[focusables.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+
+  /** CSV export via Blob download. */
+  function downloadCSV(filename, rows) {
+    if (!rows || !rows.length) { Toast.show('Nothing to export', 'warn'); return false; }
+    const head = Object.keys(rows[0]);
+    const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    const csv = [head.join(','), ...rows.map((r) => head.map((h) => esc(r[h])).join(','))].join('\r\n');
+    try {
+      const blob = new Blob(["\ufeff" + csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 400);
+      return true;
+    } catch (e) { Toast.show('Download blocked by the browser', 'err'); return false; }
+  }
+
+  return { $, $$, storage, uid, clamp, round, escapeHtml, debounce, throttle, now, addHours, fmtDate, fmtDay, ago,
+    hoursLeft, haversine, fmtDist, tokenize, truncate, initials, hashHue, colorFor, placeholderImage,
+    downscaleImage, readVideo, statusClass, pct, trapFocus, downloadCSV };
+})();
+
+/* ==========================================================================
+ * 1. I18N — every label, status, toast and demo caption (EN / தமிழ்)
+ * ======================================================================== */
+const I18N = {
+  en: {
+    'brand.tag': 'Tambaram · Chennai',
+    'nav.landing': 'Home', 'nav.report': 'Report', 'nav.map': 'Live Map', 'nav.mine': 'My Reports',
+    'nav.official': 'Department', 'nav.admin': 'Impact', 'nav.auth': 'Sign in',
+    'role.citizen': 'Citizen', 'role.official': 'Official', 'role.admin': 'Admin', 'role.guest': 'Guest',
+    'nav.theme': 'Toggle colour theme', 'nav.lang': 'Language', 'nav.a11y': 'Accessibility options', 'nav.notifications': 'Notifications',
+    'nav.stats': 'Open data', 'action.open': 'Open', 'action.done': 'Done', 'map.reportHere': 'Report an issue here', 'map.openForm': 'Open the report form', 'map.pinSet': 'Location pinned — finish your report.',
+    'a11y.title': 'Accessibility & data', 'a11y.large': 'Large UI', 'a11y.contrast': 'High contrast', 'a11y.reduce': 'Reduce motion',
+    'a11y.lowbw': 'Low-bandwidth mode (text only)', 'a11y.reset': 'Reset preferences',
+    'hero.eyebrow': 'AI-assisted civic reporting · Chennai & Tambaram',
+    'hero.h1a': 'Report it once.', 'hero.h1b': 'Watch it get', 'hero.h1c': 'fixed.',
+    'hero.sub': 'CivicConnect triages potholes, garbage, drainage, water and streetlight complaints with on-device AI, routes them to the right department and keeps every citizen informed until it is closed.',
+    'hero.cta1': 'Report an issue', 'hero.cta2': 'Explore the live map', 'hero.cta3': 'Play guided demo',
+    'hero.sla': 'Average first response', 'hero.resolved': 'Resolved this month', 'hero.citizens': 'Citizens reporting',
+    'how.title': 'How it works', 'how.sub': 'Five steps from a photo on your phone to a verified fix.',
+    'step1.t': 'Snap or describe', 'step1.d': 'Photo, video or a spoken description in Tamil or English. GPS is filled automatically; use the map pin if the signal is poor.',
+    'step2.t': 'AI triage', 'step2.d': 'Category, severity, sentiment, department and a priority score (0-100) are computed instantly, with a visible reason for every score.',
+    'step3.t': 'Duplicate radar', 'step3.d': 'TF-IDF text similarity plus 150 m geofencing merges reports of the same issue — supporters replace duplicates.',
+    'step4.t': 'Routed to a desk', 'step4.d': 'The department sees only its own queue, assigns field staff, and carries a live SLA countdown on every ticket.',
+    'step5.t': 'Proof, then closure', 'step5.d': 'A resolution needs an after-photo and a note. Citizens confirm, reject or reopen — and rate the response.',
+    'feat.title': 'Built for real civic work', 'feat.sub': 'Every module below is functional in this demo.',
+    'stat.reports': 'Reports filed', 'stat.resolved': 'Closed by citizens', 'stat.sla': 'Within SLA', 'stat.rating': 'Average rating',
+    'feat.summary': 'Officer briefing', 'feat.summary.d': 'One click turns the filtered queue into a short action report with hotspots and overdue counts.',
+    'feat.explain': 'Explainable priority', 'feat.explain.d': 'Every score opens a breakdown: severity, supporters, sentiment, critical facilities nearby, age and category weight.',
+    'feat.dup': 'Duplicate-to-support', 'feat.dup.d': 'Three pothole reports at the same college gate become one ticket with three supporters — not three fragmented queues.',
+    'feat.access': 'Accessible by default', 'feat.access.d': 'Large-UI, high-contrast, reduced-motion and a low-bandwidth text-only mode, plus full Tamil labels.',
+    'feat.proof': 'Evidence-gated closure', 'feat.proof.d': 'The state machine physically blocks "Resolved" without an after-photo and a note, and logs every transition.',
+    'feat.map': 'Density map', 'feat.map.d': 'Colour-coded markers plus a pure-JS grid-bucket heatmap layer you can toggle.',
+    'testi.title': 'Voices from the ward',
+    'cta.title': 'Your street can be on this list', 'cta.sub': 'Two minutes, one photo, and a ticket that cannot be quietly forgotten.',
+    'map.title': 'Live civic map', 'map.sub': 'Pan, filter and upvote. Markers are colour-coded by status and priority.',
+    'map.filterCat': 'Category', 'map.filterStatus': 'Status', 'map.near': 'Near me', 'map.heat': 'Density heatmap', 'map.reset': 'Reset filters',
+    'map.search': 'Search street, area or keyword', 'map.legend': 'Legend', 'map.drawer': 'Issues in view', 'map.count': '{n} issues',
+    'map.located': 'Location found', 'map.denied': 'Location permission denied — drag the pin instead',
+    'map.empty': 'No complaints match these filters.',
+    'form.title': 'Report a civic issue', 'form.sub': 'It takes under a minute. Fields marked * are required.',
+    'form.step1': 'Issue', 'form.step2': 'Category', 'form.step3': 'Evidence', 'form.step4': 'Location', 'form.step5': 'Review',
+    'form.fTitle': 'Title', 'form.fTitlePh': 'Deep pothole at Tambaram Sanatorium bus stop',
+    'form.fDesc': 'Description', 'form.fDescPh': 'Describe what you see, how long it has been there and who it affects.',
+    'form.voice': 'Speak instead', 'form.voiceStop': 'Stop listening', 'form.voiceHint': 'Voice input needs Chrome or Edge and microphone permission. You can always type.',
+    'form.voiceUnsupported': 'Voice input is not supported in this browser — please type your description.',
+    'form.voiceDone': 'Voice captured', 'form.fCat': 'Category', 'form.autoCat': 'AI suggestion',
+    'form.fMedia': 'Photo or video', 'form.fMediaHint': 'Up to 3 files. Images are downscaled in your browser before they are attached.',
+    'form.drop': 'Drop files here or click to browse', 'form.mediaMax': 'Maximum 3 files', 'form.fLoc': 'Location',
+    'form.useGps': 'Use my location', 'form.gpsBusy': 'Locating…', 'form.dragPin': 'Drag the pin to correct the location',
+    'form.fAddress': 'Landmark / address (optional)', 'form.fAddressPh': 'Near Tambaram railway station, west gate',
+    'form.anon': 'Report anonymously', 'form.anonHint': 'Anonymous reporting is available for selected categories only.',
+    'form.anonBlocked': 'Anonymous reporting is not available for this category.',
+    'form.review': 'Review and submit', 'form.back': 'Back', 'form.next': 'Continue', 'form.submit': 'Submit report',
+    'form.aiTitle': 'AI analysis', 'form.aiScan': 'Analysing your report…', 'form.dupTitle': 'Similar issue nearby',
+    'form.dupSupport': 'Support this existing report', 'form.dupAnyway': 'Submit anyway', 'form.dupNone': 'No near-duplicates found within 150 m — this looks like a new issue.',
+    'form.dupNote': 'Supporting adds your upvote to the existing ticket instead of creating a new one.',
+    'form.required': 'This field is required', 'form.tooShort': 'Please give at least {n} characters',
+    'form.okTitle': 'Report submitted', 'form.ok': 'Ticket {id} created and routed to {dept}. Priority {score}/100 ({band}).',
+    'form.merged': 'Merged as a supporter of {id} — thanks for avoiding a duplicate.',
+    'form.needCat': 'Pick a category to continue', 'form.needLoc': 'Set a location point to continue',
+    'detail.why': 'Why this priority?', 'detail.supporters': 'supporters', 'detail.follow': 'Follow', 'detail.following': 'Following',
+    'detail.upvote': 'Support', 'detail.comments': 'Comments', 'detail.addComment': 'Add a comment (optional photo)',
+    'detail.commentPh': 'Add context, or attach evidence…', 'detail.post': 'Post comment', 'detail.timeline': 'Status history',
+    'detail.resolution': 'Resolution proof', 'detail.before': 'Before', 'detail.after': 'After', 'detail.confirm': 'Confirm fixed',
+    'detail.reject': 'Not fixed', 'detail.reopen': 'Reopen', 'detail.rate': 'Rate the response', 'detail.ratePrompt': 'How well was this handled?',
+    'detail.duplicateOf': 'Duplicate of', 'detail.duplicates': 'Linked duplicates', 'detail.flagged': 'Flagged for review',
+    'detail.anon': 'Anonymous reporter', 'detail.reportedBy': 'Reported by', 'detail.assign': 'Assign to staff', 'detail.assigned': 'Assigned to',
+    'detail.advanced': 'Advance status', 'detail.sla': 'SLA due', 'detail.overdue': 'Overdue', 'detail.slaLeft': '{h}h left',
+    'detail.report': 'Report this complaint', 'detail.share': 'Share', 'detail.notFound': 'That complaint does not exist.',
+    'mine.title': 'My reports', 'mine.sub': 'Your tickets, their SLA clocks and what happened last.',
+    'mine.impact': 'Your impact', 'mine.nearby': 'Nearby issues', 'mine.empty': 'You have not reported anything yet.',
+    'mine.filed': 'Filed', 'mine.supporting': 'Supporting', 'mine.following': 'Following',
+    'off.title': 'Department queue', 'off.sub': 'Only complaints routed to {dept} appear here.',
+    'off.board': 'Board', 'off.table': 'Table', 'off.overdueOnly': 'Overdue only', 'off.assign': 'Assign',
+    'off.proof': 'Add proof', 'off.brief': 'Officer briefing', 'off.staff': 'Field staff', 'off.age': 'Age',
+    'off.filterSev': 'Min severity', 'off.empty': 'No complaints in this column.',
+    'admin.title': 'Impact dashboard', 'admin.sub': 'City-wide performance, hotspots and SLA compliance.',
+    'admin.export': 'Export CSV', 'admin.flags': 'Flagged queue', 'admin.summary': 'Generate briefing',
+    'admin.slaHours': 'SLA hours by category', 'admin.hotspots': 'Hotspot ranking', 'admin.compliance': 'SLA compliance',
+    'admin.avgRating': 'Average citizen rating', 'admin.affected': 'Citizens affected', 'admin.resolution': 'Avg resolution time',
+    'admin.approve': 'Approve', 'admin.reject': 'Reject', 'admin.ban': 'Ban reporter',
+    'stats.title': 'Public resolution statistics', 'stats.sub': 'Open data for Tambaram — how fast, how many, how well.',
+    'stats.byCat': 'By category', 'stats.byDept': 'By department', 'stats.trend': '30-day trend',
+    'stats.rating': 'Citizen rating', 'stats.hours': 'Resolution time (hours)',
+    'auth.title': 'Sign in', 'auth.register': 'Create an account', 'auth.name': 'Full name', 'auth.email': 'Email',
+    'auth.pass': 'Password (demo only — anything works)', 'auth.pick': 'Demo accounts', 'auth.continueAs': 'Continue as',
+    'auth.or': 'or use a demo account', 'auth.guest': 'Continue as guest', 'auth.logout': 'Sign out',
+    'auth.err.name': 'Enter your name', 'auth.err.email': 'Enter a valid email', 'auth.err.pass': 'Password must be at least 4 characters',
+    'auth.welcome': 'Welcome back, {name}', 'auth.registered': 'Account created for {name}', 'auth.loggedOut': 'Signed out',
+    'auth.roleLocked': 'Signed in as a citizen. Switch role in the top bar to try official or admin tools.',
+    'toast.roleCitizen': 'Citizen view: report, upvote, comment and confirm fixes.',
+    'toast.roleOfficial': 'Official view: {dept} queue with SLA clocks and assignment.',
+    'toast.roleAdmin': 'Admin view: departments, SLA rules, flags and analytics.',
+    'toast.upvoted': 'Support added — {n} supporters now.', 'toast.removed': 'Support removed.',
+    'toast.following': 'You will be notified about {id}.', 'toast.unfollowed': 'Stopped following {id}.',
+    'toast.comment': 'Comment posted.', 'toast.assigned': '{id} assigned to {staff}.',
+    'toast.status': '{id} moved to {status}.', 'toast.invalid': 'Cannot move {id} from {from} to {to}.',
+    'toast.proofNeeded': 'A resolution needs an after-photo and a note.',
+    'toast.confirmed': 'Thanks! {id} is closed.', 'toast.rejected': 'Sent back to the department as reopened.',
+    'toast.rated': 'Rating saved: {n}/5.', 'toast.flag': 'Sent to the admin review queue.',
+    'toast.flagApprove': 'Complaint re-published.', 'toast.flagReject': 'Complaint removed from the public map.',
+    'toast.banned': 'Reporter banned from posting.', 'toast.brief': 'Briefing generated below.',
+    'toast.export': 'CSV exported ({n} rows).', 'toast.slaSaved': 'SLA limits updated.',
+    'toast.authNeeded': 'Sign in or pick a role to do that.', 'toast.roleDenied': 'Your role cannot perform this action.',
+    'toast.copied': 'Link copied to clipboard.', 'toast.copiedFail': 'Copy failed — select the address bar manually.',
+    'toast.mediaMax': 'You can attach at most 3 files.', 'toast.mediaType': 'Only images and video are allowed.',
+    'toast.mediaAdded': 'Media attached.', 'toast.locFail': 'Could not read the location. Drag the pin instead.',
+    'toast.demoDone': 'Demo complete — the ticket is green on the map.',
+    'demo.play': 'Play Demo', 'demo.skip': 'Skip', 'demo.stop': 'Stop',
+    'status.Submitted': 'Submitted', 'status.Verified': 'Verified', 'status.Assigned': 'Assigned', 'status.In Progress': 'In Progress',
+    'status.Resolved': 'Resolved', 'status.Closed': 'Closed', 'status.Reopened': 'Reopened',
+    'cat.road damage': 'Road damage', 'cat.waste': 'Garbage / waste', 'cat.drainage': 'Drainage', 'cat.water': 'Water supply',
+    'cat.streetlight': 'Streetlight', 'cat.public safety': 'Public safety',
+    'pri.high': 'high priority', 'pri.pending': 'pending', 'pri.progress': 'in progress', 'pri.resolved': 'resolved', 'pri.dup': 'duplicate / linked',
+    'empty.title': 'Nothing here yet', 'empty.media': 'No media attached',
+    'err.generic': 'Something went wrong.', 'err.offline': 'Map tiles are unavailable — showing a schematic grid instead.',
+    'tab.all': 'All', 'tab.mine': 'Mine', 'tab.overdue': 'Overdue'
+  },
+  ta: {
+    'brand.tag': 'தாம்பரம் · சென்னை',
+    'nav.landing': 'முகப்பு', 'nav.report': 'புகார்', 'nav.map': 'நேரடி வரைபடம்', 'nav.mine': 'எனது புகார்கள்',
+    'nav.official': 'துறை', 'nav.admin': 'தாக்கம்', 'nav.auth': 'உள்நுழை',
+    'role.citizen': 'குடிமகன்', 'role.official': 'அதிகாரி', 'role.admin': 'நிர்வாகி', 'role.guest': 'விருந்தினர்',
+    'nav.theme': 'நிறத் தீம் மாற்று', 'nav.lang': 'மொழி', 'nav.a11y': 'அணுகல் விருப்பங்கள்', 'nav.notifications': 'அறிவிப்புகள்',
+    'nav.stats': 'திறந்த தரவு', 'action.open': 'திற', 'action.done': 'முடிந்தது', 'map.reportHere': 'இங்கே புகார் அளிக்கவா?', 'map.openForm': 'புகார் படிவத்தைத் திற', 'map.pinSet': 'இருப்பிடம் குறிக்கப்பட்டது — புகாரை முடிக்கவும்.',
+    'a11y.title': 'அணுகல் & தரவு', 'a11y.large': 'பெரிய இடைமுகம்', 'a11y.contrast': 'அதிக மாறுபாடு', 'a11y.reduce': 'அசைவைக் குறை',
+    'a11y.lowbw': 'குறைந்த தரவு முறை (உரை மட்டும்)', 'a11y.reset': 'விருப்பங்களை மீட்டமை',
+    'hero.eyebrow': 'AI உதவி குடிமை புகார் · சென்னை & தாம்பரம்',
+    'hero.h1a': 'ஒரே முறை புகார் அளியுங்கள்.', 'hero.h1b': 'சரிசெய்யப்படுவதை', 'hero.h1c': 'பாருங்கள்.',
+    'hero.sub': 'குழி, குப்பை, வடிகால், தண்ணீர் கசிவு, தெருவிளக்கு புகார்களை CivicConnect உடனடியாக வகைப்படுத்தி, சரியான துறைக்கு அனுப்பி, முடியும் வரை உங்களுக்குத் தெரிவிக்கிறது.',
+    'hero.cta1': 'புகார் அளிக்க', 'hero.cta2': 'வரைபடம் பார்க்க', 'hero.cta3': 'வழிகாட்டு டெமோ',
+    'hero.sla': 'சராசரி முதல் பதில்', 'hero.resolved': 'இந்த மாதம் தீர்க்கப்பட்டவை', 'hero.citizens': 'புகார் அளிக்கும் குடிமக்கள்',
+    'how.title': 'இது எப்படி வேலை செய்கிறது', 'how.sub': 'புகைப்படத்திலிருந்து சரிபார்க்கப்பட்ட தீர்வு வரை ஐந்து படிகள்.',
+    'step1.t': 'படமெடுங்கள் அல்லது விவரியுங்கள்', 'step1.d': 'புகைப்படம், வீடியோ அல்லது தமிழில் குரல் விவரம். GPS தானாக நிரப்பப்படும்; சிக்னல் இல்லாவிட்டால் வரைபடத்தில் ஊசியை நகர்த்துங்கள்.',
+    'step2.t': 'AI ஆய்வு', 'step2.d': 'வகை, தீவிரம், உணர்வு, துறை மற்றும் முன்னுரிமை மதிப்பெண் (0-100) உடனே கணக்கிடப்படும்; காரணமும் காட்டப்படும்.',
+    'step3.t': 'நகல் ரேடார்', 'step3.d': 'TF-IDF உரை ஒற்றுமை + 150 மீ எல்லை — ஒரே புகார் மீண்டும் வந்தால் இணைக்கப்பட்டு, நகல் வாக்காக மாறும்.',
+    'step4.t': 'துறைக்கு அனுப்புதல்', 'step4.d': 'துறை தனது புகார்களை மட்டுமே பார்க்கும்; கள ஊழியரிடம் ஒப்படைத்து SLA கடிகாரத்துடன் கண்காணிக்கும்.',
+    'step5.t': 'ஆதாரம், பிறகு மூடல்', 'step5.d': 'தீர்வுக்கு பின்-புகைப்படமும் குறிப்பும் கட்டாயம். குடிமகன் உறுதி செய்யலாம், நிராகரிக்கலாம் அல்லது மீண்டும் திறக்கலாம்.',
+    'feat.title': 'உண்மையான பணிக்காக கட்டப்பட்டது', 'feat.sub': 'இங்குள்ள ஒவ்வொரு தொகுதியும் இந்த டெமோவில் இயங்குகிறது.',
+    'stat.reports': 'பதிவான புகார்கள்', 'stat.resolved': 'குடிமக்களால் மூடப்பட்டவை', 'stat.sla': 'SLA நேரத்தில்', 'stat.rating': 'சராசரி மதிப்பீடு',
+    'feat.summary': 'அதிகாரி அறிக்கை', 'feat.summary.d': 'ஒரே கிளிக்கில் வடிகட்டிய புகார்களை சுருக்கமான நடவடிக்கை அறிக்கையாக மாற்றும்.',
+    'feat.explain': 'விளக்கக்கூடிய முன்னுரிமை', 'feat.explain.d': 'ஒவ்வொரு மதிப்பெண்ணுக்கும் காரணப் பட்டியல்: தீவிரம், ஆதரவு, உணர்வு, அருகிலுள்ள முக்கிய இடங்கள், வயது, வகை.',
+    'feat.dup': 'நகலை ஆதரவாக மாற்று', 'feat.dup.d': 'ஒரே கல்லூரி வாயிலில் மூன்று குழி புகார்கள் ஒரே டிக்கெட்டாக — மூன்று ஆதரவுகளுடன்.',
+    'feat.access': 'இயல்பாகவே அணுகக்கூடியது', 'feat.access.d': 'பெரிய UI, அதிக மாறுபாடு, குறைந்த அசைவு, குறைந்த தரவு உரை முறை மற்றும் முழு தமிழ்.',
+    'feat.proof': 'ஆதாரம் இல்லாமல் மூடல் இல்லை', 'feat.proof.d': 'பின்-புகைப்படமும் குறிப்பும் இல்லாமல் "தீர்க்கப்பட்டது" நிலைக்கு மாற முடியாது; ஒவ்வொரு மாற்றமும் பதிவாகும்.',
+    'feat.map': 'அடர்த்தி வரைபடம்', 'feat.map.d': 'நிறக் குறியீடுகள் மற்றும் தூய JS அடர்த்தி ஹீட்மேப் அடுக்கு.',
+    'testi.title': 'வார்டு குரல்கள்',
+    'cta.title': 'உங்கள் தெரு இந்த பட்டியலில் இருக்கலாம்', 'cta.sub': 'இரண்டு நிமிடம், ஒரு புகைப்படம் — மறக்க முடியாத டிக்கெட்.',
+    'map.title': 'நேரடி குடிமை வரைபடம்', 'map.sub': 'நகர்த்தி, வடிகட்டி, ஆதரவு அளியுங்கள்.',
+    'map.filterCat': 'வகை', 'map.filterStatus': 'நிலை', 'map.near': 'எனக்கு அருகில்', 'map.heat': 'அடர்த்தி ஹீட்மேப்', 'map.reset': 'வடிகட்டிகளை மீட்டமை',
+    'map.search': 'தெரு, பகுதி அல்லது சொல்', 'map.legend': 'விளக்கம்', 'map.drawer': 'காட்சியில் உள்ள புகார்கள்', 'map.count': '{n} புகார்கள்',
+    'map.located': 'இருப்பிடம் கிடைத்தது', 'map.denied': 'இருப்பிட அனுமதி மறுக்கப்பட்டது — ஊசியை நகர்த்துங்கள்',
+    'map.empty': 'இந்த வடிகட்டிகளுக்கு புகார் இல்லை.',
+    'form.title': 'குடிமை புகார் அளிக்க', 'form.sub': 'ஒரு நிமிடத்திற்குள் முடியும். * உள்ளவை கட்டாயம்.',
+    'form.step1': 'புகார்', 'form.step2': 'வகை', 'form.step3': 'ஆதாரம்', 'form.step4': 'இருப்பிடம்', 'form.step5': 'சரிபார்',
+    'form.fTitle': 'தலைப்பு', 'form.fTitlePh': 'தாம்பரம் சானடோரியம் பஸ் நிலையத்தில் ஆழமான குழி',
+    'form.fDesc': 'விவரம்', 'form.fDescPh': 'என்ன பார்க்கிறீர்கள், எவ்வளவு காலமாக உள்ளது, யாரை பாதிக்கிறது என விவரியுங்கள்.',
+    'form.voice': 'பேசி பதிவு செய்', 'form.voiceStop': 'நிறுத்து', 'form.voiceHint': 'குரல் உள்ளீட்டுக்கு Chrome அல்லது Edge மற்றும் மைக்ரோஃபோன் அனுமதி தேவை.',
+    'form.voiceUnsupported': 'இந்த உலாவியில் குரல் உள்ளீடு இல்லை — தட்டச்சு செய்யுங்கள்.',
+    'form.voiceDone': 'குரல் பதிவானது', 'form.fCat': 'வகை', 'form.autoCat': 'AI பரிந்துரை',
+    'form.fMedia': 'புகைப்படம் அல்லது வீடியோ', 'form.fMediaHint': 'அதிகபட்சம் 3 கோப்புகள். படங்கள் உலாவியிலேயே சுருக்கப்படும்.',
+    'form.drop': 'கோப்புகளை இங்கே இழுக்கவும் அல்லது தட்டவும்', 'form.mediaMax': 'அதிகபட்சம் 3 கோப்புகள்', 'form.fLoc': 'இருப்பிடம்',
+    'form.useGps': 'எனது இருப்பிடம்', 'form.gpsBusy': 'தேடுகிறது…', 'form.dragPin': 'இருப்பிடத்தை சரிசெய்ய ஊசியை நகர்த்துங்கள்',
+    'form.fAddress': 'அடையாளம் / முகவரி (விருப்பம்)', 'form.fAddressPh': 'தாம்பரம் ரயில் நிலையம் அருகில், மேற்கு வாயில்',
+    'form.anon': 'அநாமதேயமாக புகார்', 'form.anonHint': 'சில வகைகளுக்கு மட்டுமே அநாமதேய வசதி.',
+    'form.anonBlocked': 'இந்த வகைக்கு அநாமதேய புகார் அனுமதிக்கப்படாது.',
+    'form.review': 'சரிபார்த்து சமர்ப்பிக்க', 'form.back': 'பின்செல்', 'form.next': 'தொடர்', 'form.submit': 'புகார் சமர்ப்பி',
+    'form.aiTitle': 'AI பகுப்பாய்வு', 'form.aiScan': 'உங்கள் புகார் ஆய்வு செய்யப்படுகிறது…', 'form.dupTitle': 'அருகில் உள்ள ஒத்த புகார்',
+    'form.dupSupport': 'இந்த புகாரை ஆதரிக்க', 'form.dupAnyway': 'இருந்தாலும் சமர்ப்பி', 'form.dupNone': '150 மீ தொலைவில் நகல் இல்லை — இது புதிய புகார்.',
+    'form.dupNote': 'ஆதரித்தால் புதிய டிக்கெட் உருவாகாமல் நீங்கள் ஆதரவாளராக சேர்கிறீர்கள்.',
+    'form.required': 'இது கட்டாயம்', 'form.tooShort': 'குறைந்தது {n} எழுத்துகள் தேவை',
+    'form.okTitle': 'புகார் சமர்ப்பிக்கப்பட்டது', 'form.ok': 'டிக்கெட் {id} உருவாக்கப்பட்டு {dept} துறைக்கு அனுப்பப்பட்டது. முன்னுரிமை {score}/100 ({band}).',
+    'form.merged': '{id} புகாருக்கு ஆதரவாக இணைக்கப்பட்டது — நகலைத் தவிர்த்ததற்கு நன்றி.',
+    'form.needCat': 'தொடர ஒரு வகையைத் தேர்ந்தெடுக்கவும்', 'form.needLoc': 'தொடர ஒரு இருப்பிடத்தை அமைக்கவும்',
+    'detail.why': 'இந்த முன்னுரிமை ஏன்?', 'detail.supporters': 'ஆதரவாளர்கள்', 'detail.follow': 'பின்தொடர்', 'detail.following': 'பின்தொடர்கிறீர்கள்',
+    'detail.upvote': 'ஆதரவு', 'detail.comments': 'கருத்துகள்', 'detail.addComment': 'கருத்து (விருப்ப புகைப்படம்)',
+    'detail.commentPh': 'விவரம் சேர்க்கவும் அல்லது ஆதாரம் இணைக்கவும்…', 'detail.post': 'கருத்து இடு', 'detail.timeline': 'நிலை வரலாறு',
+    'detail.resolution': 'தீர்வு ஆதாரம்', 'detail.before': 'முன்', 'detail.after': 'பின்', 'detail.confirm': 'சரிசெய்யப்பட்டது',
+    'detail.reject': 'சரிசெய்யப்படவில்லை', 'detail.reopen': 'மீண்டும் திற', 'detail.rate': 'மதிப்பிடுங்கள்', 'detail.ratePrompt': 'இது எவ்வளவு சிறப்பாக கையாளப்பட்டது?',
+    'detail.duplicateOf': 'இதன் நகல்', 'detail.duplicates': 'இணைக்கப்பட்ட நகல்கள்', 'detail.flagged': 'சரிபார்ப்புக்கு குறிக்கப்பட்டது',
+    'detail.anon': 'அநாமதேய புகார்தாரர்', 'detail.reportedBy': 'புகார் அளித்தவர்', 'detail.assign': 'ஊழியரிடம் ஒப்படை', 'detail.assigned': 'ஒப்படைக்கப்பட்டவர்',
+    'detail.advanced': 'நிலையை முன்னேற்று', 'detail.sla': 'SLA காலக்கெடு', 'detail.overdue': 'தாமதம்', 'detail.slaLeft': '{h} மணி மீதம்',
+    'detail.report': 'இந்த புகாரை குறிக்க', 'detail.share': 'பங்கிடு', 'detail.notFound': 'இந்த புகார் இல்லை.',
+    'mine.title': 'எனது புகார்கள்', 'mine.sub': 'உங்கள் டிக்கெட்டுகள், SLA நேரம் மற்றும் கடைசி நடவடிக்கை.',
+    'mine.impact': 'உங்கள் தாக்கம்', 'mine.nearby': 'அருகிலுள்ள புகார்கள்', 'mine.empty': 'நீங்கள் இன்னும் புகார் அளிக்கவில்லை.',
+    'mine.filed': 'பதிவு', 'mine.supporting': 'ஆதரவு', 'mine.following': 'பின்தொடர்வது',
+    'off.title': 'துறை வரிசை', 'off.sub': '{dept} துறைக்கு அனுப்பப்பட்ட புகார்கள் மட்டும்.',
+    'off.board': 'பலகை', 'off.table': 'அட்டவணை', 'off.overdueOnly': 'தாமதமானவை மட்டும்', 'off.assign': 'ஒப்படை',
+    'off.proof': 'ஆதாரம் சேர்', 'off.brief': 'அதிகாரி அறிக்கை', 'off.staff': 'கள ஊழியர்', 'off.age': 'வயது',
+    'off.filterSev': 'குறைந்த தீவிரம்', 'off.empty': 'இந்த நெடுவரிசையில் புகார் இல்லை.',
+    'admin.title': 'தாக்கம் டாஷ்போர்டு', 'admin.sub': 'நகர அளவிலான செயல்திறன், ஹாட்ஸ்பாட் மற்றும் SLA இணக்கம்.',
+    'admin.export': 'CSV ஏற்றுமதி', 'admin.flags': 'குறிக்கப்பட்டவை', 'admin.summary': 'அறிக்கை உருவாக்கு',
+    'admin.slaHours': 'வகை வாரியாக SLA மணி', 'admin.hotspots': 'ஹாட்ஸ்பாட் தரவரிசை', 'admin.compliance': 'SLA இணக்கம்',
+    'admin.avgRating': 'சராசரி மதிப்பீடு', 'admin.affected': 'பாதிக்கப்பட்ட குடிமக்கள்', 'admin.resolution': 'சராசரி தீர்வு நேரம்',
+    'admin.approve': 'அனுமதி', 'admin.reject': 'நிராகரி', 'admin.ban': 'புகார்தாரரை தடை',
+    'stats.title': 'பொது தீர்வு புள்ளிவிவரங்கள்', 'stats.sub': 'தாம்பரத்திற்கான திறந்த தரவு — எவ்வளவு வேகம், எத்தனை, எவ்வளவு நன்று.',
+    'stats.byCat': 'வகை வாரியாக', 'stats.byDept': 'துறை வாரியாக', 'stats.trend': '30 நாள் போக்கு',
+    'stats.rating': 'குடிமகன் மதிப்பீடு', 'stats.hours': 'தீர்வு நேரம் (மணி)',
+    'auth.title': 'உள்நுழை', 'auth.register': 'கணக்கு உருவாக்கு', 'auth.name': 'முழு பெயர்', 'auth.email': 'மின்னஞ்சல்',
+    'auth.pass': 'கடவுச்சொல் (டெமோ — எதுவும் சரி)', 'auth.pick': 'டெமோ கணக்குகள்', 'auth.continueAs': 'இவராக தொடர்',
+    'auth.or': 'அல்லது டெமோ கணக்கை பயன்படுத்தவும்', 'auth.guest': 'விருந்தினராக தொடர்', 'auth.logout': 'வெளியேறு',
+    'auth.err.name': 'பெயரை உள்ளிடவும்', 'auth.err.email': 'சரியான மின்னஞ்சலை உள்ளிடவும்', 'auth.err.pass': 'கடவுச்சொல் குறைந்தது 4 எழுத்து',
+    'auth.welcome': 'மீண்டும் வருக, {name}', 'auth.registered': '{name} கணக்கு உருவாக்கப்பட்டது', 'auth.loggedOut': 'வெளியேறியது',
+    'auth.roleLocked': 'குடிமகனாக உள்நுழைந்துள்ளீர்கள். அதிகாரி/நிர்வாகி கருவிகளுக்கு மேல் பட்டியில் பங்கை மாற்றவும்.',
+    'toast.roleCitizen': 'குடிமகன் பார்வை: புகார், ஆதரவு, கருத்து மற்றும் உறுதி.',
+    'toast.roleOfficial': 'அதிகாரி பார்வை: {dept} வரிசை, SLA மற்றும் ஒப்படைப்பு.',
+    'toast.roleAdmin': 'நிர்வாகி பார்வை: துறைகள், SLA விதிகள், குறிப்புகள், பகுப்பாய்வு.',
+    'toast.upvoted': 'ஆதரவு சேர்க்கப்பட்டது — இப்போது {n} ஆதரவாளர்கள்.', 'toast.removed': 'ஆதரவு நீக்கப்பட்டது.',
+    'toast.following': '{id} பற்றி அறிவிப்பு வரும்.', 'toast.unfollowed': '{id} பின்தொடர்வது நிறுத்தப்பட்டது.',
+    'toast.comment': 'கருத்து பதிவானது.', 'toast.assigned': '{id} {staff}க்கு ஒப்படைக்கப்பட்டது.',
+    'toast.status': '{id} நிலை → {status}.', 'toast.invalid': '{id} ஐ {from} இலிருந்து {to} க்கு மாற்ற முடியாது.',
+    'toast.proofNeeded': 'தீர்வுக்கு பின்-புகைப்படமும் குறிப்பும் தேவை.',
+    'toast.confirmed': 'நன்றி! {id} மூடப்பட்டது.', 'toast.rejected': 'மீண்டும் திறக்கப்பட்டு துறைக்கு அனுப்பப்பட்டது.',
+    'toast.rated': 'மதிப்பீடு சேமிக்கப்பட்டது: {n}/5.', 'toast.flag': 'நிர்வாகி சரிபார்ப்பு வரிசைக்கு அனுப்பப்பட்டது.',
+    'toast.flagApprove': 'புகார் மீண்டும் வெளியிடப்பட்டது.', 'toast.flagReject': 'புகார் பொது வரைபடத்திலிருந்து நீக்கப்பட்டது.',
+    'toast.banned': 'புகார்தாரர் தடை செய்யப்பட்டார்.', 'toast.brief': 'அறிக்கை கீழே உருவாக்கப்பட்டது.',
+    'toast.export': 'CSV ஏற்றுமதி ({n} வரிசைகள்).', 'toast.slaSaved': 'SLA வரம்புகள் புதுப்பிக்கப்பட்டன.',
+    'toast.authNeeded': 'இதற்கு உள்நுழையவும் அல்லது பங்கைத் தேர்வு செய்யவும்.', 'toast.roleDenied': 'உங்கள் பங்கிற்கு இந்த செயல் அனுமதி இல்லை.',
+    'toast.copied': 'இணைப்பு நகலெடுக்கப்பட்டது.', 'toast.copiedFail': 'நகலெடுக்க முடியவில்லை — முகவரியை கைமுறையாக நகலெடுக்கவும்.',
+    'toast.mediaMax': 'அதிகபட்சம் 3 கோப்புகள் இணைக்கலாம்.', 'toast.mediaType': 'படங்கள் அல்லது வீடியோ மட்டும்.',
+    'toast.mediaAdded': 'ஆதாரம் இணைக்கப்பட்டது.', 'toast.locFail': 'இருப்பிடம் பெற முடியவில்லை. ஊசியை நகர்த்துங்கள்.',
+    'toast.demoDone': 'டெமோ முடிந்தது — டிக்கெட் வரைபடத்தில் பச்சையாக உள்ளது.',
+    'demo.play': 'டெமோ இயக்கு', 'demo.skip': 'தவிர்', 'demo.stop': 'நிறுத்து',
+    'status.Submitted': 'சமர்ப்பிக்கப்பட்டது', 'status.Verified': 'சரிபார்க்கப்பட்டது', 'status.Assigned': 'ஒப்படைக்கப்பட்டது', 'status.In Progress': 'நடைபெறுகிறது',
+    'status.Resolved': 'தீர்க்கப்பட்டது', 'status.Closed': 'மூடப்பட்டது', 'status.Reopened': 'மீண்டும் திறக்கப்பட்டது',
+    'cat.road damage': 'சாலை சேதம்', 'cat.waste': 'குப்பை / கழிவு', 'cat.drainage': 'வடிகால்', 'cat.water': 'குடிநீர்',
+    'cat.streetlight': 'தெருவிளக்கு', 'cat.public safety': 'பொது பாதுகாப்பு',
+    'pri.high': 'அதி முன்னுரிமை', 'pri.pending': 'நிலுவை', 'pri.progress': 'நடைபெறுகிறது', 'pri.resolved': 'தீர்க்கப்பட்டது', 'pri.dup': 'நகல் / இணைக்கப்பட்டது',
+    'empty.title': 'இன்னும் எதுவும் இல்லை', 'empty.media': 'ஆதாரம் இணைக்கப்படவில்லை',
+    'err.generic': 'ஏதோ தவறு நடந்தது.', 'err.offline': 'வரைபட ஓடுகள் கிடைக்கவில்லை — திட்ட கட்டம் காட்டப்படுகிறது.',
+    'tab.all': 'அனைத்தும்', 'tab.mine': 'எனது', 'tab.overdue': 'தாமதம்'
+  }
+};
+/** Translate with {placeholder} interpolation; falls back to English then the key. */
+function t(key, vars) {
+  const dict = I18N[Store.state.lang] || I18N.en;
+  let out = dict[key] != null ? dict[key] : (I18N.en[key] != null ? I18N.en[key] : key);
+  if (vars) out = out.replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+  return out;
+}
+
+/* ==========================================================================
+ * 2. CONSTANTS — categories, departments, SLA, POIs, status machine
+ * ======================================================================== */
+const CATEGORIES = [
+  { id: 'road damage', icon: 'i-road', dept: 'PWD — Roads & Bridges', weight: 1.0, slaHours: 72, color: '#FF5C7A' },
+  { id: 'waste', icon: 'i-trash', dept: 'Sanitation & Solid Waste', weight: 0.8, slaHours: 24, color: '#A3E635' },
+  { id: 'drainage', icon: 'i-grid', dept: 'Water Supply & Drainage', weight: 1.0, slaHours: 36, color: '#22D3EE' },
+  { id: 'water', icon: 'i-drop', dept: 'Water Supply & Drainage', weight: 1.0, slaHours: 24, color: '#38BDF8' },
+  { id: 'streetlight', icon: 'i-light', dept: 'Electrical & Street Lighting', weight: 0.6, slaHours: 48, color: '#FBBF24' },
+  { id: 'public safety', icon: 'i-shield', dept: 'Public Safety & Enforcement', weight: 1.0, slaHours: 12, color: '#C084FC' }
+];
+
+const STATUSES = ['Submitted', 'Verified', 'Assigned', 'In Progress', 'Resolved', 'Closed', 'Reopened'];
+/** The state machine. `evidence` = requires an after-photo + note. */
+const TRANSITIONS = {
+  Submitted: { Verified: { roles: ['official', 'admin', 'system'] }, Reopened: { roles: ['admin', 'system'] } },
+  Verified: { Assigned: { roles: ['official', 'admin', 'system'] } },
+  Assigned: { 'In Progress': { roles: ['official', 'admin', 'system'] } },
+  'In Progress': { Resolved: { roles: ['official', 'admin'], evidence: true } },
+  Resolved: { Closed: { roles: ['citizen', 'admin'] }, Reopened: { roles: ['citizen', 'admin'] } },
+  Closed: { Reopened: { roles: ['citizen', 'admin'] } },
+  Reopened: { Assigned: { roles: ['official', 'admin', 'system'] } }
+};
+const STATUS_TO_COLUMN = { Reopened: 'Assigned', Closed: 'Resolved' };
+const STATUS_COLOR = { high: '#FF5C7A', pending: '#FBBF24', progress: '#38BDF8', resolved: '#34D399', dup: '#A78BFA' };
+const DUP_THRESHOLD = 0.65, RELATED_THRESHOLD = 0.5, DUP_RADIUS_M = 150;
+const ANON_ALLOWED = ['waste', 'streetlight', 'road damage'];
+/** Hard-coded critical facilities used by the priority model (proximity weight). */
+const POIS = [
+  { name: 'Tambaram Sanatorium Railway Station', type: 'transport', lat: 12.9225, lng: 80.1252 },
+  { name: 'Government Hospital Tambaram', type: 'hospital', lat: 12.9245, lng: 80.1285 },
+  { name: 'Chitlapakkam Government Higher Secondary School', type: 'school', lat: 12.9340, lng: 80.1425 },
+  { name: 'Madras Christian College, Tambaram', type: 'college', lat: 12.9187, lng: 80.1209 },
+  { name: 'Selaiyur Bus Terminus', type: 'transport', lat: 12.9095, lng: 80.1385 },
+  { name: 'Tambaram Market Junction', type: 'market', lat: 12.9237, lng: 80.1272 },
+  { name: 'GST Road, Tambaram', type: 'main road', lat: 12.9205, lng: 80.1255 },
+  { name: 'Chromepet Government Hospital', type: 'hospital', lat: 12.9516, lng: 80.1416 },
+  { name: 'Perungalathur KSR School', type: 'school', lat: 12.9045, lng: 80.0916 },
+  { name: 'Velachery Main Road Junction', type: 'main road', lat: 12.9405, lng: 80.1172 },
+  { name: 'Pallavaram Bus Stand', type: 'transport', lat: 12.9675, lng: 80.1495 }
+];
+const POI_WEIGHT = { school: 1, college: 1, hospital: 1, transport: 0.8, market: 0.7, 'main road': 0.85 };
+const STAFF = {
+  'PWD — Roads & Bridges': ['Selvam K. (Road Inspector)', 'Anitha R. (Assistant Engineer)', 'Muthu S. (Gang Leader)'],
+  'Sanitation & Solid Waste': ['Priya M. (Sanitary Inspector)', 'Dinesh V. (Ward Supervisor)'],
+  'Water Supply & Drainage': ['Arun P. (Junior Engineer)', 'Kavitha N. (Pipeline Inspector)'],
+  'Electrical & Street Lighting': ['Ravi T. (Wireman)', 'Gokul B. (AE Electrical)'],
+  'Public Safety & Enforcement': ['Inspector Devi S.', 'Constable Raj V.']
+};
+const PRIORITY_BANDS = [{ min: 70, key: 'high', color: STATUS_COLOR.high }, { min: 45, key: 'progress', color: STATUS_COLOR.progress }, { min: 0, key: 'pending', color: STATUS_COLOR.pending }];
+const TESTIMONIALS = [
+  { en: 'I reported the same pothole three times last year. This time the ticket showed me a photo of the repair.', ta: 'போன வருடம் ஒரே குழியை மூன்று முறை சொன்னேன். இந்த முறை பழுது நீக்கிய புகைப்படம் டிக்கெட்டில் வந்தது.', name: 'Lakshmi N.', role: 'Resident, West Tambaram' },
+  { en: 'Our street light queue finally has a clock on it. The ward councillor sees the same dashboard we do.', ta: 'எங்கள் தெரு விளக்கு விண்ணப்பத்துக்கு இப்போது கடிகாரம் உள்ளது. எங்களைப் போலவே கவுன்சிலரும் பார்க்கிறார்.', name: 'Imran S.', role: 'Shop owner, Selaiyur' },
+  { en: 'Three of us reported the same blocked drain and it merged into one — the department saw one issue with three supporters.', ta: 'மூன்று பேர் ஒரே வடிகாலை சொன்னோம் — ஒரே புகாராக இணைந்தது, மூன்று ஆதரவுகளுடன்.', name: 'Revathi K.', role: 'Sanatorium resident' },
+  { en: 'The AI put "live wire near school" at priority 94 without me explaining anything. That is the trick.', ta: '"பள்ளி அருகில் மின் கம்பி" என்பதை நான் விளக்காமலேயே AI 94 முன்னுரிமை எனக் கூறியது.', name: 'Arjun M.', role: 'Parent, Chitlapakkam' },
+  { en: 'I can report in Tamil, see the status in Tamil and the ward can reply in English. Same ticket.', ta: 'தமிழில் புகார் அளிக்கிறேன், தமிழில் நிலையைப் பார்க்கிறேன். ஒரே டிக்கெட்.', name: 'Bhuvana R.', role: 'Madras Christian College' },
+  { en: 'Proof-gated closure was the fix. No after-photo, no closure — we stopped getting fake resolutions.', ta: 'ஆதாரம் இல்லாமல் மூடல் இல்லை — போலி தீர்வுகள் நின்றன.', name: 'Ward 14 Committee', role: 'Tambaram' }
+];

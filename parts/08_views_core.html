@@ -1,0 +1,691 @@
+/* ==========================================================================
+ * 10. VIEW: LANDING — hero, live ticker, how-it-works, bento features, map preview
+ * ======================================================================== */
+const LandingView = () => {
+  let mapView = null, stopParticles = null;
+  function render(root) {
+    const m = Store.computeMetrics();
+    const trend = m.trend.map((d) => d.filed);
+    const tickerItems = [
+      `${m.total} ${t('stat.reports')}`,
+      `${m.byStatus['In Progress']} ${t('pri.progress')}`,
+      `${m.overdue} ${t('tab.overdue')}`,
+      `${t('stat.sla')} ${m.slaPct}%`,
+      `${t('stat.rating')} ${m.avgRating ? Utils.round(m.avgRating, 1) : '—'}/5`,
+      `${m.affected} ${t('admin.affected')}`,
+      `${m.byColor.high} ${t('pri.high')}`,
+      `${m.byColor.dup} ${t('pri.dup')}`
+    ];
+    const steps = [
+      ['step1.t', 'step1.d', 'i-camera'], ['step2.t', 'step2.d', 'i-sparkle'], ['step3.t', 'step3.d', 'i-target'],
+      ['step4.t', 'step4.d', 'i-staff'], ['step5.t', 'step5.d', 'i-shield']
+    ];
+    root.innerHTML = `
+    <section class="hero glass" aria-labelledby="heroTitle">
+      <div class="mesh" aria-hidden="true"></div>
+      <div class="blob b1" aria-hidden="true"></div><div class="blob b2" aria-hidden="true"></div><div class="blob b3" aria-hidden="true"></div>
+      <canvas class="particles" id="heroParticles" aria-hidden="true"></canvas>
+      <div class="wrap hero-inner tilt" data-tilt="6">
+        <span class="eyebrow"><svg width="14" height="14" aria-hidden="true"><use href="#i-sparkle"/></svg>${t('hero.eyebrow')}</span>
+        <h1 id="heroTitle" style="margin-top:16px;max-width:19ch">${t('hero.h1a')} <span class="grad-text word">${t('hero.h1b')}</span> <span class="word">${t('hero.h1c')}</span></h1>
+        <p id="heroSub" class="muted" style="max-width:60ch;font-size:1.06rem">${t('hero.sub')}</p>
+        <div class="row" id="heroCtas" style="margin-top:20px">
+          <a class="btn btn-primary pulse-cta" href="#/report" data-magnetic="1"><svg width="17" height="17" aria-hidden="true"><use href="#i-plus-circle"/></svg>${t('hero.cta1')}</a>
+          <a class="btn" href="#/map"><svg width="17" height="17" aria-hidden="true"><use href="#i-map"/></svg>${t('hero.cta2')}</a>
+          <button class="btn btn-ghost" id="playDemoHero"><svg width="15" height="15" aria-hidden="true"><use href="#i-play"/></svg>${t('hero.cta3')}</button>
+        </div>
+        <div class="grid g-4" id="heroStats" style="margin-top:28px">
+          ${Components.kpi(t('stat.reports'), m.total, { spark: trend, color: '#22D3EE', sub: `${m.byCategory[0].n} × ${t('cat.' + m.byCategory[0].cat)}` })}
+          ${Components.kpi(t('stat.resolved'), m.closedCount, { spark: m.trend.map((d) => d.closed), color: '#34D399', sub: `${m.resolvedCount} ${t('pri.resolved')}` })}
+          ${Components.kpi(t('stat.sla'), m.slaPct, { suffix: '%', spark: m.byDept.map((d) => d.slaPct), color: '#A3E635', sub: `${m.overdue} ${t('tab.overdue')}` })}
+          ${Components.kpi(t('stat.rating'), m.avgRating ? Utils.round(m.avgRating, 1) : 0, { dec: 1, suffix: '/5', spark: m.byDept.map((d) => d.total), color: '#FBBF24', sub: `${m.ratingCount} ${t('detail.rate')}` })}
+        </div>
+      </div>
+      <div class="ticker" aria-hidden="true">
+        <div class="ticker-track">${[...tickerItems, ...tickerItems].map((x) => `<span class="tick"><span class="legend-dot" style="background:var(--aqua)"></span>${Utils.escapeHtml(x)}</span>`).join('')}</div>
+      </div>
+    </section>
+
+    <section class="section wrap" id="howPin" aria-labelledby="howTitle">
+      <div class="between reveal">
+        <div>
+          <h2 id="howTitle">${t('how.title')}</h2>
+          <p class="muted mb0">${t('how.sub')}</p>
+        </div>
+        <a class="btn btn-aqua" href="#/report">${t('hero.cta1')}</a>
+      </div>
+      <div class="steps" style="margin-top:24px">
+        <div class="steps-line" aria-hidden="true"><i></i></div>
+        ${steps.map(([tk, dk, ic], i) => `
+          <article class="step reveal" data-step="${i}">
+            <span class="n" aria-hidden="true">${i + 1}</span>
+            <div class="row" style="gap:10px;margin-bottom:6px">
+              <svg width="20" height="20" aria-hidden="true"><use href="#${ic}"/></svg>
+              <h3 style="margin:0">${t(tk)}</h3>
+            </div>
+            <p class="mb0 muted" style="font-size:.92rem">${t(dk)}</p>
+          </article>`).join('')}
+      </div>
+    </section>
+
+    <section class="section wrap" aria-labelledby="featTitle">
+      <h2 id="featTitle" class="reveal">${t('feat.title')}</h2>
+      <p class="muted reveal">${t('feat.sub')}</p>
+      <div class="bento" style="margin-top:20px">
+        <article class="bcard b-span-3 reveal" data-tilt="7">
+          <div class="glare" aria-hidden="true"></div>
+          <div class="ficon"><svg width="24" height="24" aria-hidden="true"><use href="#i-doc"/></svg></div>
+          <h3>${t('feat.summary')}</h3><p class="muted mb0 small">${t('feat.summary.d')}</p>
+          <button class="btn btn-sm btn-aqua" style="margin-top:12px" id="briefDemo">${t('admin.summary')}</button>
+          <pre id="briefOut" class="small" style="white-space:pre-wrap;margin:12px 0 0;color:var(--text-2);display:none"></pre>
+        </article>
+        <article class="bcard b-span-3 reveal" data-tilt="7">
+          <div class="glare" aria-hidden="true"></div>
+          <div class="ficon"><svg width="24" height="24" aria-hidden="true"><use href="#i-chart"/></svg></div>
+          <h3>${t('feat.explain')}</h3><p class="muted mb0 small">${t('feat.explain.d')}</p>
+          <div style="margin-top:12px">${Components.whyPriority(Store.state.complaints.slice().sort((a, b) => b.priorityScore - a.priorityScore)[0])}</div>
+        </article>
+        <article class="bcard b-span-2 reveal" data-tilt="7"><div class="glare" aria-hidden="true"></div>
+          <div class="ficon"><svg width="24" height="24" aria-hidden="true"><use href="#i-link"/></svg></div>
+          <h3>${t('feat.dup')}</h3><p class="muted mb0 small">${t('feat.dup.d')}</p></article>
+        <article class="bcard b-span-2 reveal" data-tilt="7"><div class="glare" aria-hidden="true"></div>
+          <div class="ficon"><svg width="24" height="24" aria-hidden="true"><use href="#i-access"/></svg></div>
+          <h3>${t('feat.access')}</h3><p class="muted mb0 small">${t('feat.access.d')}</p></article>
+        <article class="bcard b-span-2 reveal" data-tilt="7"><div class="glare" aria-hidden="true"></div>
+          <div class="ficon"><svg width="24" height="24" aria-hidden="true"><use href="#i-shield"/></svg></div>
+          <h3>${t('feat.proof')}</h3><p class="muted mb0 small">${t('feat.proof.d')}</p></article>
+      </div>
+    </section>
+
+    <section class="section wrap" aria-labelledby="mapPrevTitle">
+      <div class="between reveal">
+        <div><h2 id="mapPrevTitle">${t('map.title')}</h2><p class="muted mb0">${t('map.sub')}</p></div>
+        <a class="btn" href="#/map">${t('hero.cta2')}</a>
+      </div>
+      <div class="map-shell reveal" style="margin-top:18px">
+        <div id="landingMap" style="height:clamp(320px,44dvh,460px)"></div>
+        <div class="map-fallback" aria-hidden="true"><div class="center"><strong>${t('map.title')}</strong><div class="small muted">Schematic grid — tiles unavailable</div></div></div>
+        <div class="map-ctrls right"><div class="map-panel glass">${Components.legend()}</div></div>
+      </div>
+    </section>
+
+    <section class="section wrap" aria-labelledby="testiTitle">
+      <h2 id="testiTitle" class="reveal">${t('testi.title')}</h2>
+      <div class="marquee" style="margin-top:18px" aria-hidden="true">
+        <div class="marquee-track">
+          ${[...TESTIMONIALS, ...TESTIMONIALS].map((q) => `<blockquote class="quote glass"><div class="stars ro" aria-hidden="true">${'★'.repeat(5)}</div>
+            <p class="small">“${Utils.escapeHtml(Store.state.lang === 'ta' ? q.ta : q.en)}”</p>
+            <footer class="tiny muted"><strong>${Utils.escapeHtml(q.name)}</strong> · ${Utils.escapeHtml(q.role)}</footer></blockquote>`).join('')}
+        </div>
+      </div>
+    </section>
+
+    <section class="section wrap">
+      <div class="glass card grad center reveal" style="padding:clamp(24px,5vw,54px)">
+        <h2>${t('cta.title')}</h2>
+        <p class="muted" style="max-width:52ch;margin:0 auto 18px">${t('cta.sub')}</p>
+        <div class="row" style="justify-content:center">
+          <a class="btn btn-primary" href="#/report" data-magnetic="1">${t('hero.cta1')}</a>
+          <a class="btn btn-ghost" href="#/stats">${t('stats.title')}</a>
+        </div>
+        <div class="row" style="justify-content:center;margin-top:18px">
+          <span class="sdg s11">SDG 11</span><span class="sdg s16">SDG 16</span>
+        </div>
+      </div>
+    </section>`;
+
+    // Landing extras: brief generator, hero demo button
+    const brief = Utils.$('#briefDemo');
+    if (brief) brief.addEventListener('click', () => {
+      const out = Utils.$('#briefOut');
+      out.textContent = Services.summarizeForOfficials(Store.state.complaints.filter((c) => c.status !== 'Closed'), 'all departments');
+      out.style.display = 'block';
+    });
+    const pd = Utils.$('#playDemoHero');
+    if (pd) pd.addEventListener('click', () => Demo.start());
+    // Hero particle canvas (pauses with the tab, stopped when the view unmounts)
+    if (stopParticles) stopParticles();
+    stopParticles = Motion.particles('heroParticles');
+  }
+  function mount() {
+    const el = document.getElementById('landingMap');
+    if (el) { mapView = createMapView(el, { zoom: 12.4, center: [12.921, 80.125] }); mapView.init(); mapView.sync(); }
+  }
+  function destroy() { if (mapView) { mapView.destroy(); mapView = null; } if (stopParticles) { stopParticles(); stopParticles = null; } }
+  const update = () => { if (mapView) mapView.sync(); };
+  return { id: 'landing', render, mount, update, destroy };
+};
+
+/* ==========================================================================
+ * 11. VIEW: AUTH — login / register / demo accounts (simulated)
+ * ======================================================================== */
+const AuthView = () => {
+  let mode = 'login';
+  function render(root) {
+    const demoUsers = ['citizen', 'official', 'admin'].map((role) => ({ role, users: Store.state.users.filter((u) => u.role === role && !u.id.startsWith('u-x')).slice(0, 3) }));
+    root.innerHTML = `
+    <div class="wrap section" style="max-width:1000px">
+      <div class="grid g-2">
+        <div class="card glass grad reveal" style="padding:clamp(20px,3vw,32px)">
+          <div class="tabs" role="tablist" aria-label="${t('auth.title')}">
+            <button class="tab" role="tab" aria-selected="${mode === 'login'}" data-mode="login">${t('auth.title')}</button>
+            <button class="tab" role="tab" aria-selected="${mode === 'register'}" data-mode="register">${t('auth.register')}</button>
+          </div>
+          <form id="authForm" novalidate>
+            ${mode === 'register' ? `<div class="mb16"><label for="aName">${t('auth.name')}</label><input class="input" id="aName" autocomplete="name" required /><div class="field-error" id="eName"></div></div>` : ''}
+            <div class="mb16"><label for="aEmail">${t('auth.email')}</label><input class="input" id="aEmail" type="email" autocomplete="email" required placeholder="priya@example.com" /><div class="field-error" id="eEmail"></div></div>
+            <div class="mb16"><label for="aPass">${t('auth.pass')}</label><input class="input" id="aPass" type="password" autocomplete="current-password" required value="demo1234" /><div class="field-error" id="ePass"></div></div>
+            <button class="btn btn-primary btn-block" type="submit">${mode === 'login' ? t('auth.title') : t('auth.register')}</button>
+          </form>
+          <hr class="hr" />
+          <button class="btn btn-ghost btn-block" id="guestBtn">${t('auth.guest')}</button>
+          <p class="tiny muted" style="margin-top:12px">${t('auth.roleLocked')}</p>
+        </div>
+        <div class="card glass reveal">
+          <h3>${t('auth.or')}</h3>
+          <div class="stack" style="gap:14px">
+            ${demoUsers.map((g) => `
+              <div>
+                <div class="row between mb8"><span class="chip">${t('role.' + g.role)}</span></div>
+                ${g.users.map((u) => `<button class="btn btn-sm btn-ghost btn-block" style="justify-content:flex-start;margin-bottom:6px" data-demo="${u.id}">
+                  ${Components.avatar(u)}<span style="margin-left:6px">${Utils.escapeHtml(u.name)}${u.department ? ` <span class="tiny muted">· ${Utils.escapeHtml(u.department)}</span>` : ''}</span></button>`).join('')}
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+    Utils.$$('[data-mode]', root).forEach((b) => b.addEventListener('click', () => { mode = b.dataset.mode; render(root); }));
+    Utils.$$('[data-demo]', root).forEach((b) => b.addEventListener('click', () => {
+      const u = Store.user(b.dataset.demo);
+      Store.state.userId = u.id; Store.state.role = u.role;
+      Toast.show(t('auth.welcome', { name: u.name }), 'ok');
+      Store.emit('auth');
+      Router.go(u.role === 'admin' ? '#/admin' : u.role === 'official' ? '#/official' : '#/mine');
+    }));
+    const guest = Utils.$('#guestBtn');
+    if (guest) guest.addEventListener('click', () => { Store.Auth.logout(); Router.go('#/'); });
+    const form = Utils.$('#authForm', root);
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const email = Utils.$('#aEmail').value.trim();
+      const pass = Utils.$('#aPass').value;
+      const name = mode === 'register' && Utils.$('#aName') ? Utils.$('#aName').value.trim() : '';
+      const res = mode === 'register' ? Store.Auth.register({ name, email, password: pass }) : Store.Auth.login({ email, password: pass });
+      // Inline field errors (validation lives in the service layer, surfaced here)
+      Utils.$('#eEmail').textContent = res.ok ? '' : (res.error === 'auth.err.email' ? t('auth.err.email') : '');
+      Utils.$('#ePass').textContent = res.ok ? '' : (res.error === 'auth.err.pass' ? t('auth.err.pass') : '');
+      if (mode === 'register' && Utils.$('#eName')) Utils.$('#eName').textContent = res.ok ? '' : (res.error === 'auth.err.name' ? t('auth.err.name') : '');
+      if (res.ok) Router.go(Store.state.role === 'admin' ? '#/admin' : Store.state.role === 'official' ? '#/official' : '#/mine');
+    });
+  }
+  return { id: 'auth', render };
+};
+
+/* ==========================================================================
+ * 12. VIEW: REPORT WIZARD — 5 animated steps + live AI + duplicate radar
+ * ======================================================================== */
+let ReportApi = null;   // exposed for the guided demo
+const ReportView = () => {
+  const draft = {
+    title: '', description: '', category: null, media: [], location: { lat: 12.92100, lng: 80.12500, address: '' },
+    anonymous: false, mediaHint: ''
+  };
+  // Arriving from "Report an issue here" on the map pre-pins the location.
+  const handed = (typeof App !== 'undefined' && App.takePendingLocation) ? App.takePendingLocation() : null;
+  if (handed && Number.isFinite(handed.lat) && Number.isFinite(handed.lng)) { draft.location.lat = handed.lat; draft.location.lng = handed.lng; }
+  let step = 0;
+  let analysis = null;
+  let picker = null;
+  let listening = null;
+  let recog = null;
+  let submitted = null;
+  const LABELS = () => [t('form.step1'), t('form.step2'), t('form.step3'), t('form.step4'), t('form.step5')];
+
+  /* ---------- live AI ---------- */
+  function runAnalysis(showScan) {
+    const text = (draft.title + ' ' + draft.description).trim();
+    if (text.length < 6) return null;
+    analysis = Services.analyze(draft, Store.state);
+    if (showScan) {
+      Motion.scanChips(Utils.$('#aiChips'), aiChipHtml(analysis), 200);
+    }
+    return analysis;
+  }
+  function aiChipHtml(a) {
+    const conf = Math.round(a.classification.confidence * 100);
+    return [
+      `<span class="res-chip"><svg width="13" height="13" aria-hidden="true"><use href="#i-${Store.categoryMeta(a.category).icon.split('-').slice(1).join('-')}"/></svg>
+        <strong>${t('cat.' + a.category)}</strong> <span class="tiny muted">${conf}%</span></span>`,
+      `<span class="res-chip">${t('off.filterSev')}: ${Components.sevDots(a.severity.severity)}</span>`,
+      `<span class="res-chip"><svg width="13" height="13" aria-hidden="true"><use href="#i-staff"/></svg>${Utils.escapeHtml(a.department)}</span>`,
+      `<span class="res-chip">${t('detail.why')} <strong class="st-${a.priority.score >= 70 ? 'high' : a.priority.score >= 45 ? 'progress' : 'pending'}">${a.priority.score}</strong>/100</span>`,
+      `<span class="res-chip">${a.sentiment.urgent ? '⚑ ' + t('detail.flagged') : t('status.Submitted')}</span>`
+    ];
+  }
+  /* ---------- step renderers ---------- */
+  function stepHtml() {
+    if (step === 0) return `
+      <fieldset class="fieldset">
+        <legend>${t('form.step1')}</legend>
+        <div class="mb16">
+          <label for="rTitle">${t('form.fTitle')} *</label>
+          <input class="input" id="rTitle" maxlength="110" placeholder="${Utils.escapeHtml(t('form.fTitlePh'))}" value="${Utils.escapeHtml(draft.title)}" />
+          <div class="field-error" id="eTitle"></div>
+        </div>
+        <div>
+          <label for="rDesc">${t('form.fDesc')} *</label>
+          <textarea class="textarea" id="rDesc" maxlength="1200" placeholder="${Utils.escapeHtml(t('form.fDescPh'))}">${Utils.escapeHtml(draft.description)}</textarea>
+          <div class="row between" style="margin-top:6px">
+            <div class="field-error" id="eDesc"></div>
+            <button class="btn btn-sm" id="voiceBtn" type="button" aria-pressed="false">
+              <svg width="15" height="15" aria-hidden="true"><use href="#i-mic"/></svg>${t('form.voice')}
+            </button>
+          </div>
+          <p class="hint" id="voiceHint">${t('form.voiceHint')}</p>
+        </div>
+      </fieldset>`;
+    if (step === 1) return `
+      <fieldset class="fieldset">
+        <legend>${t('form.fCat')}</legend>
+        <div class="cat-cards" role="group" aria-label="${t('form.fCat')}">
+          ${CATEGORIES.map((c) => `<button class="cat-card" type="button" role="button" aria-pressed="${draft.category === c.id}" data-cat="${c.id}">
+            <svg width="24" height="24" aria-hidden="true" style="color:${c.color}"><use href="#${c.icon}"/></svg>
+            <div style="font-weight:700;margin-top:8px">${t('cat.' + c.id)}</div>
+            <div class="tiny muted">${Utils.escapeHtml(c.dept)} · SLA ${c.slaHours}h</div>
+          </button>`).join('')}
+        </div>
+        ${analysis ? `<div class="row" style="margin-top:14px"><span class="chip bg-dup st-dup"><svg width="13" height="13" aria-hidden="true"><use href="#i-sparkle"/></svg>${t('form.autoCat')}: ${t('cat.' + analysis.category)} · ${Math.round(analysis.classification.confidence * 100)}%</span></div>` : `<p class="hint" style="margin-top:12px">${t('form.needCat')}</p>`}
+      </fieldset>`;
+    if (step === 2) return `
+      <fieldset class="fieldset">
+        <legend>${t('form.fMedia')}</legend>
+        <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="${t('form.drop')}">
+          <svg width="26" height="26" aria-hidden="true"><use href="#i-camera"/></svg>
+          <div style="font-weight:700;margin-top:8px">${t('form.drop')}</div>
+          <div class="tiny muted">${t('form.fMediaHint')} — ${t('form.mediaMax')}</div>
+          <input type="file" id="fileInput" accept="image/*,video/*" multiple class="sr" />
+        </div>
+        <div class="media-grid" id="mediaGrid">
+          ${draft.media.map((src, i) => mediaItem(src, i)).join('')}
+        </div>
+        <div id="scanWrap" class="scan-wrap hide" style="margin-top:14px">
+          <div class="scan-line" aria-hidden="true"></div>
+          <div class="card tight glass">
+            <div class="row" style="gap:8px"><span class="ring-mini" style="--p:${Math.round((analysis ? analysis.classification.confidence : 0.9) * 100)}"><span>${Math.round((analysis ? analysis.classification.confidence : 0.9) * 100)}%</span></span>
+            <div><strong>${t('form.aiTitle')}</strong><div class="tiny muted">${t('form.aiScan')}</div></div></div>
+            <div class="row" id="aiChips" style="margin-top:12px"></div>
+          </div>
+        </div>
+      </fieldset>`;
+    if (step === 3) return `
+      <fieldset class="fieldset">
+        <legend>${t('form.fLoc')}</legend>
+        <div class="row mb8">
+          <button class="btn btn-sm btn-aqua" id="gpsBtn" type="button"><svg width="15" height="15" aria-hidden="true"><use href="#i-target"/></svg><span>${t('form.useGps')}</span></button>
+          <span class="tiny muted">${t('form.dragPin')}</span>
+        </div>
+        <div class="map-shell" style="position:relative">
+          <div id="pickerMap" style="height:240px"></div>
+          <div class="map-fallback"><div class="center small">${t('form.dragPin')}</div></div>
+        </div>
+        <div style="margin-top:12px">
+          <label for="rAddr">${t('form.fAddress')}</label>
+          <input class="input" id="rAddr" maxlength="120" placeholder="${Utils.escapeHtml(t('form.fAddressPh'))}" value="${Utils.escapeHtml(draft.location.address)}" />
+        </div>
+        <div style="margin-top:14px">
+          <label class="switch">
+            <input type="checkbox" id="anonToggle" ${draft.anonymous ? 'checked' : ''} ${ANON_ALLOWED.includes(draft.category) ? '' : 'disabled'} />
+            <span class="track" aria-hidden="true"></span>
+            <span>${t('form.anon')}</span>
+          </label>
+          <p class="hint">${ANON_ALLOWED.includes(draft.category) ? t('form.anonHint') : t('form.anonBlocked')}</p>
+        </div>
+      </fieldset>`;
+    // step 5: review
+    const a = analysis || runAnalysis(false);
+    const cand = a && a.duplicates.candidate;
+    return `
+      <fieldset class="fieldset">
+        <legend>${t('form.review')}</legend>
+        <div class="grid g-2">
+          <div>
+            <div class="tiny muted">${t('form.fTitle')}</div><strong>${Utils.escapeHtml(draft.title || '—')}</strong>
+            <div class="tiny muted" style="margin-top:10px">${t('form.fDesc')}</div><p class="small">${Utils.escapeHtml(draft.description || '—')}</p>
+            <div class="row" style="margin-top:10px">${Components.categoryChip(a ? a.category : draft.category)}${Components.sevDots(a ? a.severity.severity : 3)}</div>
+            <div class="tiny muted" style="margin-top:10px">${t('form.fLoc')}</div>
+            <div class="small">${Utils.escapeHtml(draft.location.address || 'Pinned on map')} · ${Utils.round(draft.location.lat, 5)}, ${Utils.round(draft.location.lng, 5)}</div>
+            ${draft.anonymous ? `<div class="chip bg-dup st-dup" style="margin-top:10px">${t('form.anon')}</div>` : ''}
+            ${draft.media.length ? `<div class="media-grid" style="margin-top:12px">${draft.media.slice(0, 3).map((s, i) => mediaItem(s, i, true)).join('')}</div>` : `<p class="hint" style="margin-top:10px">${t('empty.media')}</p>`}
+          </div>
+          <div>
+            <div class="radar-box" id="radarBox" aria-hidden="true">
+              <div class="radar-sweep"></div>
+              <div class="radar-ring" style="width:60px;height:60px"></div>
+              <div class="radar-ring" style="width:120px;height:120px"></div>
+              <div class="radar-ring" style="width:180px;height:180px"></div>
+              <div class="mk-pin" style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--aqua);color:var(--aqua)"></div>
+            </div>
+            <h4 style="margin:12px 0 6px">${t('form.dupTitle')}</h4>
+            <div id="dupCard"></div>
+          </div>
+        </div>
+      </fieldset>`;
+  }
+  function mediaItem(src, i, ro) {
+    const isVideo = /^data:video/.test(src);
+    return `<div class="media-item scan-wrap">
+      ${isVideo ? `<video src="${src}" muted playsinline></video>` : `<img src="${src}" alt="Attachment ${i + 1}" />`}
+      ${ro ? '' : `<button class="rm" type="button" data-rm="${i}" aria-label="Remove attachment ${i + 1}">×</button>`}
+    </div>`;
+  }
+  /* ---------- duplicate card ---------- */
+  function renderDupCard() {
+    const host = Utils.$('#dupCard'); if (!host) return;
+    const a = analysis || runAnalysis(false);
+    const cand = a && a.duplicates.candidate;
+    if (!cand) {
+      host.innerHTML = `<div class="card tight glass dup-card"><div class="row" style="gap:8px"><svg width="18" height="18" aria-hidden="true" style="color:var(--ok)"><use href="#i-check"/></svg>
+        <span class="small">${t('form.dupNone')}</span></div></div>`;
+      return;
+    }
+    const c = cand.complaint;
+    host.innerHTML = `<div class="card tight glass dup-card glass-high" id="dupInner">
+      <div class="row between mb8">
+        <span class="chip bg-dup st-dup">${cand.verdict === 'duplicate' ? t('form.dupTitle') : t('pri.dup')} · ${Math.round(cand.score * 100)}%</span>
+        <span class="tiny muted">${(cand.parts.text * 0.45 + cand.parts.geo * 0.35 + cand.parts.category * 0.2).toFixed(2)} · ${Utils.fmtDist(cand.distance)}</span>
+      </div>
+      <strong id="dupTarget" data-open="${c.id}" style="cursor:pointer">${Utils.escapeHtml(Utils.truncate(c.title, 64))}</strong>
+      <div class="tiny muted" style="margin:4px 0 10px">${Utils.escapeHtml(c.location.address)} · ${c.supporters.length} ${t('detail.supporters')} · ${t('status.' + c.status)}</div>
+      <div class="row" style="gap:8px">
+        <button class="btn btn-sm btn-lime" id="supportBtn">${t('form.dupSupport')}</button>
+        <button class="btn btn-sm btn-ghost" id="anywayBtn">${t('form.dupAnyway')}</button>
+      </div>
+      <p class="hint" style="margin-top:8px">${t('form.dupNote')}</p>
+    </div>`;
+    const sb = Utils.$('#supportBtn');
+    if (sb) sb.addEventListener('click', () => {
+      Motion.flyInto(Utils.$('#dupInner'), Utils.$('#dupTarget'));
+      setTimeout(() => submitReport(true), 620);
+    });
+    const ab = Utils.$('#anywayBtn');
+    if (ab) ab.addEventListener('click', () => submitReport(false));
+  }
+  /* ---------- photo handling ---------- */
+  async function handleFiles(files) {
+    const list = Array.from(files || []);
+    if (!list.length) return;
+    if (draft.media.length >= 3) { Toast.show(t('toast.mediaMax'), 'warn'); return; }
+    const room = 3 - draft.media.length;
+    for (const f of list.slice(0, room)) {
+      if (!/^(image|video)\//.test(f.type)) { Toast.show(t('toast.mediaType'), 'warn'); continue; }
+      const src = /^image\//.test(f.type) ? await Utils.downscaleImage(f) : await Utils.readVideo(f);
+      if (src) draft.media.push(src);
+    }
+    draft.mediaHint = list.map((f) => f.name).join(' ');
+    Toast.show(t('toast.mediaAdded'), 'ok');
+    // Re-render the media grid only (keeps focus stable)
+    const grid = Utils.$('#mediaGrid');
+    if (grid) grid.innerHTML = draft.media.map((s, i) => mediaItem(s, i)).join('');
+    const wrap = Utils.$('#scanWrap');
+    if (wrap) { wrap.classList.remove('hide'); runAnalysis(true); }
+  }
+  /* ---------- geolocation ---------- */
+  function useGps() {
+    const btn = Utils.$('#gpsBtn');
+    if (!navigator.geolocation) { Toast.show(t('toast.locFail'), 'warn'); return; }
+    if (btn) { btn.disabled = true; btn.querySelector('span').textContent = t('form.gpsBusy'); }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setPoint(pos.coords.latitude, pos.coords.longitude);
+        Toast.show(t('map.located'), 'ok');
+        if (btn) { btn.disabled = false; btn.querySelector('span').textContent = t('form.useGps'); }
+      },
+      () => { Toast.show(t('map.denied'), 'warn'); if (btn) { btn.disabled = false; btn.querySelector('span').textContent = t('form.useGps'); } },
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 }
+    );
+  }
+  function setPoint(lat, lng) {
+    draft.location.lat = Utils.round(lat, 6); draft.location.lng = Utils.round(lng, 6);
+    if (picker && picker.marker) picker.marker.setLatLng([lat, lng]);
+    if (picker && picker.map) picker.map.panTo([lat, lng]);
+  }
+  /* ---------- mini picker map ---------- */
+  function mountPicker() {
+    const el = Utils.$('#pickerMap');
+    if (!el || el._leaflet_id || picker) return;   // never initialise the same container twice
+    if (typeof window.L === 'undefined') { el.closest('.map-shell').classList.add('tiles-failed'); return; }
+    const map = L.map(el, { zoomControl: true, attributionControl: false }).setView([draft.location.lat, draft.location.lng], 16);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    const marker = L.marker([draft.location.lat, draft.location.lng], { draggable: true, icon: L.divIcon({ className: '', html: '<div class="mk-pin mk-drop" style="width:20px;height:20px;background:var(--aqua);color:var(--aqua)"><span class="radar" aria-hidden="true"></span></div>', iconSize: [20, 20], iconAnchor: [10, 10] }) }).addTo(map);
+    marker.on('dragend', () => { const p = marker.getLatLng(); setPoint(p.lat, p.lng); });
+    map.on('click', (e) => setPoint(e.latlng.lat, e.latlng.lng));
+    picker = { map, marker };
+    setTimeout(() => map.invalidateSize(), 150);
+  }
+  function destroyPicker() { if (picker) { try { picker.map.remove(); } catch (e) { /* noop */ } picker = null; } }
+  /* ---------- voice ---------- */
+  function setupVoice() {
+    const btn = Utils.$('#voiceBtn'); if (!btn) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      btn.addEventListener('click', () => Toast.show(t('form.voiceUnsupported'), 'warn'));
+      btn.setAttribute('aria-disabled', 'false');
+      return;
+    }
+    btn.addEventListener('click', () => {
+      if (listening) { recog && recog.stop(); return; }
+      try {
+        recog = new SR();
+        recog.lang = Store.state.lang === 'ta' ? 'ta-IN' : 'en-IN';
+        recog.continuous = false; recog.interimResults = true; recog.maxAlternatives = 1;
+        let base = draft.description ? draft.description + ' ' : '';
+        recog.onresult = (e) => {
+          let interim = '', final = '';
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const txt = e.results[i][0].transcript;
+            if (e.results[i].isFinal) final += txt; else interim += txt;
+          }
+          const ta = Utils.$('#rDesc');
+          ta.value = (base + final + interim).trim();
+          draft.description = ta.value;
+          if (final) base = (base + final).trim() + ' ';
+        };
+        recog.onerror = () => { Toast.show(t('form.voiceUnsupported'), 'warn'); stopListening(); };
+        recog.onend = () => { stopListening(); if (draft.description) { Toast.show(t('form.voiceDone'), 'ok'); runAnalysis(); } };
+        recog.start(); startListening();
+      } catch (err) { Toast.show(t('form.voiceUnsupported'), 'warn'); }
+    });
+    function startListening() {
+      listening = true;
+      btn.setAttribute('aria-pressed', 'true');
+      btn.innerHTML = `<span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>${t('form.voiceStop')}`;
+      const hint = Utils.$('#voiceHint'); if (hint) hint.textContent = t('form.aiScan');
+    }
+    function stopListening() {
+      listening = false;
+      if (!btn) return;
+      btn.setAttribute('aria-pressed', 'false');
+      btn.innerHTML = `<svg width="15" height="15" aria-hidden="true"><use href="#i-mic"/></svg>${t('form.voice')}`;
+      const hint = Utils.$('#voiceHint'); if (hint) hint.textContent = t('form.voiceHint');
+    }
+  }
+  /* ---------- submit ---------- */
+  function submitReport(supportExisting) {
+    if (!analysis) runAnalysis(false);
+    const res = Actions.submitReport(draft, analysis, { supportExisting });
+    if (!res) return;
+    submitted = res;
+    if (res.merged) {
+      Utils.$('#wizardBody').innerHTML = successHtml(res.complaint, true);
+      Motion.Confetti.burst(0.8);
+    } else {
+      Utils.$('#wizardBody').innerHTML = successHtml(res.complaint, false);
+      Motion.Confetti.burst(1.2);
+      // Fake "notification" round trip so the citizen sees the ticket move.
+      setTimeout(() => Store.notify({ title: res.complaint.id + ' queued for verification', body: res.complaint.department, complaintId: res.complaint.id, kind: 'status', audience: 'citizen', userId: res.complaint.reporterId }), 1800);
+    }
+    const again = Utils.$('#againBtn');
+    if (again) again.addEventListener('click', () => { submitted = null; draft.title = ''; draft.description = ''; draft.media = []; draft.category = null; analysis = null; step = 0; render(Utils.$('#viewRoot')); });
+  }
+  function successHtml(c, merged) {
+    const m = Store.computeMetrics();
+    return `<div class="card glass grad center" style="padding:clamp(20px,4vw,40px)">
+      <div class="eico" style="width:64px;height:64px;margin:0 auto 12px;border-radius:20px;display:grid;place-items:center;background:linear-gradient(135deg,var(--lime),var(--aqua));color:#06210f">
+        <svg width="30" height="30" aria-hidden="true"><use href="#i-check"/></svg></div>
+      <h2>${merged ? t('form.merged', { id: c.id }) : t('form.okTitle')}</h2>
+      <p class="muted">${merged ? Utils.escapeHtml(c.title) : t('form.ok', { id: c.id, dept: c.department, score: c.priorityScore, band: t('pri.' + Store.bandFor(c.priorityScore).key) })}</p>
+      <div class="row" style="justify-content:center;margin-top:8px">
+        <button class="btn btn-primary" data-open="${c.id}">${t('detail.why')} → ${c.id}</button>
+        <a class="btn" href="#/mine">${t('nav.mine')}</a>
+        <button class="btn btn-ghost" id="againBtn">${t('hero.cta1')}</button>
+      </div>
+      <p class="tiny muted" style="margin-top:14px">${t('stat.reports')}: ${m.total} · ${t('stat.sla')}: ${m.slaPct}%</p>
+    </div>`;
+  }
+  /* ---------- main render ---------- */
+  function render(root) {
+    destroyPicker();
+    const isGuest = Store.isGuest();
+    root.innerHTML = `
+    <div class="wrap section" style="max-width:960px">
+      <div class="between reveal">
+        <div>
+          <h2 style="margin-bottom:4px">${t('form.title')}</h2>
+          <p class="muted mb0">${t('form.sub')}</p>
+        </div>
+        <span class="chip">${t('role.' + Store.state.role)}</span>
+      </div>
+      <div class="card glass grad" style="margin-top:18px">
+        ${Components.wizardSteps(LABELS(), step)}
+        <div class="bar sm" style="margin-bottom:16px"><i style="width:${(step / 5) * 100}%"></i></div>
+        <div id="wizardBody" class="wstep"></div>
+        <div class="row between" style="margin-top:18px">
+          <button class="btn btn-ghost" id="backBtn" ${step === 0 ? 'disabled' : ''}>${t('form.back')}</button>
+          <div class="row">
+            <span class="tiny muted" id="stepHint">${step === 4 ? t('form.dupNote') : t('form.sub')}</span>
+            <button class="btn btn-primary" id="nextBtn">${step === 4 ? t('form.submit') : t('form.next')}</button>
+          </div>
+        </div>
+      </div>
+      <div class="grid g-3" style="margin-top:18px">
+        <div class="card glass flat reveal"><h4 style="margin:0 0 6px">${t('form.aiTitle')}</h4><p class="tiny muted mb0">${t('feat.explain.d')}</p></div>
+        <div class="card glass flat reveal"><h4 style="margin:0 0 6px">${t('form.dupTitle')}</h4><p class="tiny muted mb0">${t('feat.dup.d')}</p></div>
+        <div class="card glass flat reveal"><h4 style="margin:0 0 6px">${t('hero.sla')}</h4><p class="tiny muted mb0">${t('feat.proof.d')}</p></div>
+      </div>
+    </div>`;
+    bind();
+  }
+  function bind() {
+    const body = Utils.$('#wizardBody');
+    body.innerHTML = stepHtml();
+    // step-specific wiring
+    if (step === 0) {
+      const tIn = Utils.$('#rTitle'), dIn = Utils.$('#rDesc');
+      const sync = Utils.debounce(() => {
+        draft.title = tIn.value.trim(); draft.description = dIn.value.trim();
+        if (draft.title.length + draft.description.length > 8) runAnalysis(); else analysis = null;
+      }, 420);
+      tIn.addEventListener('input', sync); dIn.addEventListener('input', sync);
+      tIn.addEventListener('blur', () => { draft.title = tIn.value.trim(); runAnalysis(); });
+      setupVoice();
+    }
+    if (step === 1) {
+      Utils.$$('[data-cat]', body).forEach((b) => b.addEventListener('click', () => {
+        draft.category = b.dataset.cat;
+        if (!ANON_ALLOWED.includes(draft.category)) draft.anonymous = false;
+        runAnalysis();
+        render(Utils.$('#viewRoot'));
+      }));
+    }
+    if (step === 2) {
+      const dz = Utils.$('#dropzone'), fi = Utils.$('#fileInput');
+      dz.addEventListener('click', () => fi.click());
+      dz.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fi.click(); } });
+      fi.addEventListener('change', () => handleFiles(fi.files));
+      ['dragenter', 'dragover'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); }));
+      ['dragleave', 'drop'].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); }));
+      dz.addEventListener('drop', (e) => handleFiles(e.dataTransfer && e.dataTransfer.files));
+      if (draft.media.length) { Utils.$('#scanWrap').classList.remove('hide'); }
+      Utils.$$('[data-rm]', body).forEach((b) => b.addEventListener('click', (e) => {
+        e.stopPropagation();
+        draft.media.splice(Number(b.dataset.rm), 1);
+        Utils.$('#mediaGrid').innerHTML = draft.media.map((s, i) => mediaItem(s, i)).join('');
+        bind();
+      }));
+      if (analysis) Motion.scanChips(Utils.$('#aiChips'), aiChipHtml(analysis), 160);
+    }
+    if (step === 3) {
+      mountPicker();
+      const gps = Utils.$('#gpsBtn'); if (gps) gps.addEventListener('click', useGps);
+      const addr = Utils.$('#rAddr'); if (addr) addr.addEventListener('input', () => { draft.location.address = addr.value.trim(); });
+      const anon = Utils.$('#anonToggle');
+      if (anon) anon.addEventListener('change', () => {
+        draft.anonymous = anon.checked && ANON_ALLOWED.includes(draft.category);
+        if (anon.checked && !ANON_ALLOWED.includes(draft.category)) { anon.checked = false; Toast.show(t('form.anonBlocked'), 'warn'); }
+      });
+    }
+    if (step === 4) {
+      runAnalysis(false);
+      renderDupCard();
+      setTimeout(() => { const rb = Utils.$('#radarBox'); if (rb) rb.classList.add('in'); }, 60);
+    }
+    const back = Utils.$('#backBtn');
+    if (back) back.addEventListener('click', () => {
+      if (step <= 0) return;
+      step--; destroyPicker();
+      render(Utils.$('#viewRoot'));
+    });
+    const next = Utils.$('#nextBtn');
+    if (next) next.addEventListener('click', () => {
+      if (step === 0) {
+        draft.title = Utils.$('#rTitle').value.trim(); draft.description = Utils.$('#rDesc').value.trim();
+        const eT = Utils.$('#eTitle'), eD = Utils.$('#eDesc');
+        eT.textContent = draft.title.length < 8 ? t('form.tooShort', { n: 8 }) : '';
+        eD.textContent = draft.description.length < 20 ? t('form.tooShort', { n: 20 }) : '';
+        Utils.$('#rTitle').setAttribute('aria-invalid', String(draft.title.length < 8));
+        Utils.$('#rDesc').setAttribute('aria-invalid', String(draft.description.length < 20));
+        if (eT.textContent || eD.textContent) { Toast.show(t('form.required'), 'warn'); return; }
+        runAnalysis(false); step = 1; render(Utils.$('#viewRoot')); return;
+      }
+      if (step === 1) {
+        if (!draft.category) { Toast.show(t('form.needCat'), 'warn'); return; }
+        step = 2; render(Utils.$('#viewRoot')); return;
+      }
+      if (step === 2) { step = 3; render(Utils.$('#viewRoot')); return; }
+      if (step === 3) {
+        if (!draft.location || !draft.location.lat) { Toast.show(t('form.needLoc'), 'warn'); return; }
+        step = 4; render(Utils.$('#viewRoot')); return;
+      }
+      if (step === 4) { submitReport(false); }
+    });
+  }
+  function mount() { if (step === 3) mountPicker(); if (step === 4) { runAnalysis(false); renderDupCard(); } }
+  void ReportApi;
+  function destroy() { destroyPicker(); if (recog && listening) { try { recog.stop(); } catch (e) { /* noop */ } } }
+  /* ---------- API for the guided demo ---------- */
+  ReportApi = {
+    set(title, description, category, address) {
+      draft.title = title; draft.description = description; draft.category = category;
+      if (address) draft.location.address = address;
+      const tIn = Utils.$('#rTitle'), dIn = Utils.$('#rDesc');
+      if (tIn) tIn.value = title; if (dIn) dIn.value = description;
+      runAnalysis();
+    },
+    gotoStep(n) { step = n; destroyPicker(); render(Utils.$('#viewRoot')); },
+    getStep: () => step,
+    analyze: () => runAnalysis(true),
+    hasDuplicate: () => !!(analysis && analysis.duplicates.candidate),
+    duplicateTitle: () => (analysis && analysis.duplicates.candidate ? analysis.duplicates.candidate.complaint.title : ''),
+    submitInstead: (support) => submitReport(support),
+    simulateMedia() {
+      draft.media = [Utils.placeholderImage('demo-photo', 'pothole photo')];
+      const grid = Utils.$('#mediaGrid'); if (grid) grid.innerHTML = draft.media.map((s, i) => mediaItem(s, i)).join('');
+      Utils.$('#scanWrap') && Utils.$('#scanWrap').classList.remove('hide');
+      runAnalysis(true);
+    },
+    setPoint,
+    draft, get analysis() { return analysis; }
+  };
+  return { id: 'report', render, mount, destroy, update: () => {} };
+};

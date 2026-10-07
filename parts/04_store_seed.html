@@ -1,0 +1,413 @@
+/* ==========================================================================
+ * 3. STORE — one in-memory state object + tiny pub/sub render loop
+ *    Views never mutate state directly; they call actions, actions emit.
+ * ======================================================================== */
+const Store = (() => {
+  const listeners = new Set();
+  const S = {
+    lang: 'en',                  // 'en' | 'ta'
+    theme: 'dark',               // 'dark' | 'light'
+    role: 'citizen',             // 'citizen' | 'official' | 'admin'
+    userId: null,                // active user id (null = signed out / guest)
+    prefs: { large: false, contrast: false, reduce: false, lowbw: false },
+    route: '#/',
+    users: [], departments: [], complaints: [], notifications: [],
+    filters: {
+      map: { cats: [], statuses: [], heat: false, q: '', near: false, listOnly: false },
+      official: { sort: 'priority', dir: 'desc', minSev: 1, overdueOnly: false },
+      publicStats: 'all'
+    },
+    ui: { tabBoard: 'board', loading: false },
+    demo: { running: false, index: 0 }
+  };
+  /* ---------- pub/sub ---------- */
+  const subscribe = (fn) => { listeners.add(fn); return () => listeners.delete(fn); };
+  const emit = (evt = 'change') => { listeners.forEach((fn) => { try { fn(S, evt); } catch (e) { console.warn('render listener failed', e); } }); };
+  const set = (patch, evt) => { Object.assign(S, patch); emit(evt); };
+
+  /* ---------- lookups ---------- */
+  const user = (id = S.userId) => S.users.find((u) => u.id === id) || null;
+  const me = () => user(S.userId);
+  const isGuest = () => !S.userId;
+  const department = (id) => S.departments.find((d) => d.id === id) || null;
+  const departmentByName = (name) => S.departments.find((d) => d.name === name) || null;
+  const categoryMeta = (cat) => CATEGORIES.find((c) => c.id === cat) || CATEGORIES[0];
+  const complaint = (id) => S.complaints.find((c) => c.id === id) || null;
+  const isStaff = () => S.role === 'official' || S.role === 'admin';
+  const myDept = () => (S.role === 'official' ? (me() ? me().department : null) : null);
+
+  /** Colour key shared by chips, markers and charts. */
+  function statusColorKey(c) {
+    if (!c) return 'pending';
+    if (c.linkedTo) return 'dup';
+    if (c.status === 'Closed' || c.status === 'Resolved') return 'resolved';
+    if (c.status === 'In Progress') return 'progress';
+    if (c.priorityScore >= 70) return 'high';
+    return 'pending';
+  }
+  const bandFor = (score) => PRIORITY_BANDS.find((b) => score >= b.min) || PRIORITY_BANDS[2];
+
+  /* ---------- role-based access control (enforced here, not only in the UI) ---------- */
+  const CAPS = {
+    submit: ['citizen', 'official', 'admin'],
+    comment: ['citizen', 'official', 'admin'],
+    upvote: ['citizen', 'official', 'admin'],
+    follow: ['citizen', 'official', 'admin'],
+    confirm: ['citizen', 'admin'],
+    reject: ['citizen', 'admin'],
+    rate: ['citizen', 'admin'],
+    flag: ['citizen', 'official', 'admin'],
+    verify: ['official', 'admin'],
+    assign: ['official', 'admin'],
+    progress: ['official', 'admin'],
+    resolve: ['official', 'admin'],
+    manageSLA: ['admin'],
+    manageDepts: ['admin'],
+    reviewFlags: ['admin'],
+    exportCSV: ['admin'],
+    analytics: ['admin'],
+    officialQueue: ['official', 'admin']
+  };
+  /** Owner check for citizen-only actions on a complaint. */
+  function owns(c) { const u = me(); return !!u && !!c && (c.reporterId === u.id || (c.supporters || []).includes(u.id)); }
+  function can(action, c) {
+    if (!CAPS[action]) return { ok: false, reason: 'roleDenied' };
+    if (isGuest() && action !== 'submit') { /* guests browse and read; anything else needs identity */
+      return { ok: false, reason: 'authNeeded' };
+    }
+    if (!isGuest() && !CAPS[action].includes(S.role)) return { ok: false, reason: 'roleDenied' };
+    if (action === 'resolve' && (!c || !c.resolution || !c.resolution.afterPhoto || !c.resolution.note)) return { ok: false, reason: 'proofNeeded' };
+    if ((action === 'confirm' || action === 'reject') && c && !owns(c)) return { ok: false, reason: 'roleDenied' };
+    if (action === 'rate' && c && !owns(c)) return { ok: false, reason: 'roleDenied' };
+    if (['verify', 'assign', 'progress', 'resolve'].includes(action) && c && S.role === 'official' && me() && me().department && c.department !== me().department) {
+      return { ok: false, reason: 'roleDenied' };   // an official only touches their own department
+    }
+    return { ok: true };
+  }
+
+  /* ---------- scoping helpers used by every dashboard ---------- */
+  function visibleComplaints() {
+    const q = (S.filters.map.q || '').trim().toLowerCase();
+    let list = S.complaints.filter((c) => !c.removed);
+    if (S.role === 'official') list = list.filter((c) => c.department === myDept());
+    if (q) list = list.filter((c) => (c.title + ' ' + c.description + ' ' + c.location.address + ' ' + c.category).toLowerCase().includes(q));
+    return list;
+  }
+  function mapComplaints() {
+    const f = S.filters.map;
+    return visibleComplaints().filter((c) => {
+      if (f.cats.length && !f.cats.includes(c.category)) return false;
+      if (f.statuses.length && !f.statuses.includes(Store.statusColorKey(c))) return false;
+      if (f.near && f.center && Utils.haversine(f.center, c.location) > 2500) return false;
+      return true;
+    });
+  }
+  const myComplaints = () => { const u = me(); if (!u) return []; return S.complaints.filter((c) => c.reporterId === u.id && !c.removed); };
+  const supportedComplaints = () => { const u = me(); if (!u) return []; return S.complaints.filter((c) => c.supporters.includes(u.id) && !c.removed); };
+  const flaggedComplaints = () => S.complaints.filter((c) => (c.flags || []).some((f) => f.status === 'open'));
+  const overdue = (list) => list.filter((c) => c.status !== 'Closed' && c.status !== 'Resolved' && Utils.now() > c.slaDueAt);
+  const unreadCount = () => S.notifications.filter((n) => !n.read).length;
+
+  /** Aggregate metrics for the landing page, admin dashboard and public stats. */
+  function computeMetrics() {
+    const all = S.complaints.filter((c) => !c.removed);
+    const closed = all.filter((c) => c.status === 'Closed');
+    const resolvedEver = all.filter((c) => c.status === 'Resolved' || c.status === 'Closed');
+    const withinSla = resolvedEver.filter((c) => (c.resolution && c.resolution.at <= c.slaDueAt)).length;
+    const ratings = all.map((c) => c.resolution && c.resolution.rating).filter((r) => typeof r === 'number' && r > 0);
+    const resolutionHours = resolvedEver.filter((c) => c.resolution && c.resolution.at).map((c) => (c.resolution.at - c.createdAt) / 36e5);
+    const affected = all.reduce((sum, c) => sum + 1 + c.supporters.length + c.followers.length, 0);
+    const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0);
+    return {
+      total: all.length,
+      byStatus: STATUSES.reduce((acc, s) => { acc[s] = all.filter((c) => c.status === s).length; return acc; }, {}),
+      byColor: ['high', 'pending', 'progress', 'resolved', 'dup'].reduce((acc, k) => { acc[k] = all.filter((c) => statusColorKey(c) === k).length; return acc; }, {}),
+      byCategory: CATEGORIES.map((cat) => ({ cat: cat.id, n: all.filter((c) => c.category === cat.id).length, color: cat.color })),
+      byDept: S.departments.map((d) => {
+        const list = all.filter((c) => c.department === d.name);
+        const res = list.filter((c) => c.resolution && c.resolution.at);
+        const hrs = res.map((c) => (c.resolution.at - c.createdAt) / 36e5);
+        const ok = res.filter((c) => c.resolution.at <= c.slaDueAt).length;
+        return { id: d.id, name: d.name, total: list.length, resolved: res.length, avgHours: avg(hrs), slaPct: res.length ? Math.round((ok / res.length) * 100) : 100 };
+      }),
+      trend: Array.from({ length: 30 }, (_, i) => {
+        const day = new Date(); day.setHours(0, 0, 0, 0); day.setDate(day.getDate() - (29 - i));
+        const start = day.getTime(), end = start + 864e5;
+        return { date: start, filed: all.filter((c) => c.createdAt >= start && c.createdAt < end).length, closed: all.filter((c) => c.resolution && c.resolution.at >= start && c.resolution.at < end).length };
+      }),
+      closedCount: closed.length,
+      resolvedCount: resolvedEver.length,
+      withinSla,
+      slaPct: resolvedEver.length ? Math.round((withinSla / resolvedEver.length) * 100) : 100,
+      avgRating: avg(ratings),
+      ratingCount: ratings.length,
+      avgResolutionHours: avg(resolutionHours),
+      affected,
+      flagged: flaggedComplaints().length,
+      overdue: overdue(all).length,
+      participation: S.users.filter((u) => u.role === 'citizen').length + all.reduce((s, c) => s + c.supporters.length, 0)
+    };
+  }
+  /** Hotspot ranking = greedy clustering of all points within 300 m. */
+  function hotspots(rad = 300) {
+    const pts = S.complaints.filter((c) => !c.removed && !c.linkedTo).map((c) => ({ lat: c.location.lat, lng: c.location.lng, c }));
+    const clusters = [];
+    pts.forEach((p) => {
+      const hit = clusters.find((cl) => Utils.haversine({ lat: cl.lat, lng: cl.lng }, p) <= rad);
+      if (hit) { hit.items.push(p.c); hit.lat = (hit.lat * (hit.items.length - 1) + p.lat) / hit.items.length; hit.lng = (hit.lng * (hit.items.length - 1) + p.lng) / hit.items.length; }
+      else clusters.push({ lat: p.lat, lng: p.lng, items: [p.c] });
+    });
+    return clusters.map((cl) => ({
+      lat: cl.lat, lng: cl.lng, count: cl.items.length,
+      area: cl.items[0].location.address,
+      top: cl.items.slice().sort((a, b) => b.priorityScore - a.priorityScore)[0],
+      score: cl.items.reduce((s, c) => s + c.priorityScore, 0) / cl.items.length
+    })).filter((cl) => cl.count > 1).sort((a, b) => b.count - a.count || b.score - a.score);
+  }
+
+  /* ---------- actions ---------- */
+  /** Add a complaint (already enriched with AI fields by Services.analyze). */
+  function addComplaint(c) {
+    S.complaints.unshift(c);
+    notify({ title: t('toast.status', { id: c.id, status: t('status.' + c.status) }), body: c.title, complaintId: c.id, kind: 'status', audience: 'official', dept: c.department });
+    emit('complaint:add');
+    return c;
+  }
+  function historyAdd(c, status, by, note) { c.statusHistory.push({ status, by, at: Utils.now(), note: note || '' }); }
+  function logTransition(c, status, by, note) { historyAdd(c, status, by, note); c.status = status; }
+
+  /* ---------- notifications ---------- */
+  function notify(n) {
+    S.notifications.unshift(Object.assign({ id: Utils.uid('ntf'), at: Utils.now(), read: false }, n));
+    S.notifications = S.notifications.slice(0, 60);
+  }
+  const markAllRead = () => { S.notifications.forEach((n) => { n.read = true; }); emit('notifications'); };
+
+  /* ---------- auth (simulated) ---------- */
+  const Auth = {
+    login({ email, password }) {
+      const u = S.users.find((x) => x.email.toLowerCase() === String(email || '').toLowerCase());
+      if (!u) return { ok: false, error: 'auth.err.email' };
+      if (String(password || '').length < 4) return { ok: false, error: 'auth.err.pass' };
+      S.userId = u.id; S.role = u.role;
+      Toast.show(t('auth.welcome', { name: u.name }), 'ok');
+      emit('auth'); return { ok: true, user: u };
+    },
+    register({ name, email, password }) {
+      if (!name || name.trim().length < 2) return { ok: false, error: 'auth.err.name' };
+      if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(email || '')) return { ok: false, error: 'auth.err.email' };
+      if (String(password || '').length < 4) return { ok: false, error: 'auth.err.pass' };
+      const u = { id: Utils.uid('u'), name: name.trim(), email: email.trim(), role: 'citizen', department: null, avatarHue: Utils.hashHue(email), joined: Utils.now() };
+      S.users.push(u); S.userId = u.id; S.role = 'citizen';
+      Toast.show(t('auth.registered', { name: u.name }), 'ok');
+      emit('auth'); return { ok: true, user: u };
+    },
+    logout() { S.userId = null; S.role = 'citizen'; Toast.show(t('auth.loggedOut'), 'info'); emit('auth'); },
+    /** Demo role switcher — signs in as the first demo account of that role. */
+    switchRole(role) {
+      const u = S.users.find((x) => x.role === role);
+      if (!u) return;
+      S.userId = u.id; S.role = role;
+      if (role === 'official') Toast.show(t('toast.roleOfficial', { dept: u.department || '' }), 'info');
+      else if (role === 'admin') Toast.show(t('toast.roleAdmin'), 'info');
+      else Toast.show(t('toast.roleCitizen'), 'info');
+      emit('auth');
+    },
+    /** Official demo: hop between departments to show scoping. */
+    switchDepartment(deptName) {
+      const u = S.users.find((x) => x.role === 'official' && x.department === deptName);
+      if (u) { S.userId = u.id; }
+      emit('auth');
+    }
+  };
+
+  /* ======================================================================
+   * SEED DATA — 28 complaints around Tambaram (12.92, 80.10) + users, depts
+   * ==================================================================== */
+  function mulberry32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  function loadSeed() {
+    const rnd = mulberry32(20261007);
+    const H = 3600 * 1000;
+
+    S.departments = [
+      { id: 'd-pwd', name: 'PWD — Roads & Bridges', head: 'Er. Sridhar V.', email: 'roads@tambaram.tn.gov.in', phone: '044-2226 1101', ward: 'Ward 12-14', categories: ['road damage'] },
+      { id: 'd-san', name: 'Sanitation & Solid Waste', head: 'Dr. Meena K.', email: 'sanitation@tambaram.tn.gov.in', phone: '044-2226 1102', ward: 'All wards', categories: ['waste'] },
+      { id: 'd-wat', name: 'Water Supply & Drainage', head: 'Er. Bala M.', email: 'water@tambaram.tn.gov.in', phone: '044-2226 1103', ward: 'Ward 9-16', categories: ['water', 'drainage'] },
+      { id: 'd-ele', name: 'Electrical & Street Lighting', head: 'Er. Naveen R.', email: 'lighting@tambaram.tn.gov.in', phone: '044-2226 1104', ward: 'Ward 10-18', categories: ['streetlight'] },
+      { id: 'd-safe', name: 'Public Safety & Enforcement', head: 'Insp. Devi S.', email: 'safety@tambaram.tn.gov.in', phone: '044-2226 1105', ward: 'Ward 14', categories: ['public safety'] }
+    ];
+
+    S.users = [
+      { id: 'u-cit-1', name: 'Priya Raman', role: 'citizen', email: 'priya@example.com', department: null, joined: Utils.now() - 240 * 24 * H },
+      { id: 'u-cit-2', name: 'Karthik Subramanian', role: 'citizen', email: 'karthik@example.com', department: null, joined: Utils.now() - 180 * 24 * H },
+      { id: 'u-cit-3', name: 'Fathima Noor', role: 'citizen', email: 'fathima@example.com', department: null, joined: Utils.now() - 90 * 24 * H },
+      { id: 'u-off-1', name: 'Anitha R.', role: 'official', email: 'anitha@tambaram.tn.gov.in', department: 'PWD — Roads & Bridges', joined: Utils.now() - 500 * 24 * H },
+      { id: 'u-off-2', name: 'Arun P.', role: 'official', email: 'arun@tambaram.tn.gov.in', department: 'Water Supply & Drainage', joined: Utils.now() - 420 * 24 * H },
+      { id: 'u-off-3', name: 'Priya M.', role: 'official', email: 'priyam@tambaram.tn.gov.in', department: 'Sanitation & Solid Waste', joined: Utils.now() - 300 * 24 * H },
+      { id: 'u-adm-1', name: 'Commissioner Vasanth', role: 'admin', email: 'commissioner@tambaram.tn.gov.in', department: null, joined: Utils.now() - 700 * 24 * H },
+      { id: 'u-adm-2', name: 'Divya — SLA Cell', role: 'admin', email: 'sla@tambaram.tn.gov.in', department: null, joined: Utils.now() - 200 * 24 * H },
+      { id: 'u-adm-3', name: 'Auditor Karthik', role: 'admin', email: 'audit@tambaram.tn.gov.in', department: null, joined: Utils.now() - 150 * 24 * H }
+    ];
+    // Anonymous-looking extra citizens that act as reviewers / supporters in the seed.
+    const extras = ['Ravi Kumar', 'Sundari B.', 'Mohammed Ali', 'Jenny D.', 'Vignesh P.', 'Amala S.', 'Hari N.', 'Sneha T.', 'Barath R.', 'Nithya V.', 'Ganesh M.', 'Zara K.'];
+    extras.forEach((nm, i) => S.users.push({ id: 'u-x' + (i + 1), name: nm, role: 'citizen', email: nm.split(' ')[0].toLowerCase() + i + '@example.com', department: null, joined: Utils.now() - (60 - i * 3) * 24 * H }));
+
+    // 28 realistic complaints. `age` = hours ago; statuses cover the whole machine.
+    const RAW = [
+      { id: 'CC-1001', title: 'Deep pothole near Tambaram Sanatorium bus stop', cat: 'road damage', status: 'In Progress', by: 'u-cit-1', age: 26, sup: 9, addr: 'GST Road, Sanatorium, Tambaram', lat: 12.92270, lng: 80.12540, desc: 'A very deep pothole right at the bus stop entry. Two-wheelers swerve into traffic to avoid it and it floods completely when it rains. Very dangerous in the morning peak hour.' },
+      { id: 'CC-1002', title: 'Garbage not collected for six days, Tambaram Market', cat: 'waste', status: 'Assigned', by: 'u-cit-2', age: 30, sup: 6, addr: 'Tambaram Market Road, Ward 14', lat: 12.92370, lng: 80.12740, desc: 'The bin behind the vegetable market has not been cleared since Monday. The smell is unbearable and stray dogs are scattering waste all over the road. Urgent.' },
+      { id: 'CC-1003', title: 'Sewage overflowing onto Selaiyur Main Road', cat: 'drainage', status: 'In Progress', by: 'u-cit-3', age: 12, sup: 14, addr: 'Selaiyur Main Road, near bus terminus', lat: 12.90980, lng: 80.13880, desc: 'Manhole is overflowing and sewage is flowing on the road for the last three days. Overflowing drains are a health hazard, children walk through it to school. Please fix urgently.' },
+      { id: 'CC-1004', title: 'Street light not working on Kamaraj Street', cat: 'streetlight', status: 'Resolved', by: 'u-cit-1', age: 96, sup: 4, addr: 'Kamaraj Street, Chitlapakkam', lat: 12.93400, lng: 80.14280, desc: 'The street light opposite house number 24 has been dark for two weeks. The whole stretch is pitch dark after 7 pm and women avoid walking here.' },
+      { id: 'CC-1005', title: 'No water supply in East Tambaram for three days', cat: 'water', status: 'Closed', by: 'u-cit-2', age: 120, sup: 11, addr: 'East Tambaram, Ward 12', lat: 12.91616, lng: 80.13700, desc: 'There is no water in the pipeline for three days in our entire street. Around 40 families are buying cans every day. Please check the valve and pressure.' },
+      { id: 'CC-1006', title: 'Broken footpath slabs near Tambaram railway station', cat: 'public safety', status: 'Verified', by: 'u-cit-3', age: 40, sup: 5, addr: 'Tambaram Railway Station, west entrance', lat: 12.92240, lng: 80.12480, desc: 'Several footpath slabs are broken and one is completely missing near the west entrance. An elderly person tripped yesterday. Risk of accident for the thousands who use this gate.' },
+      { id: 'CC-1007', title: 'Large pothole at Madras Christian College west gate', cat: 'road damage', status: 'In Progress', by: 'u-cit-1', age: 20, sup: 7, addr: 'Madras Christian College west gate, Tambaram', lat: 12.91875, lng: 80.12110, desc: 'A large deep pothole has formed at the college west gate where hundreds of students cross every day. Buses take a wide turn to avoid it. It becomes invisible when it rains.' },
+      { id: 'CC-1008', title: 'Dead dog on Velachery Main Road service lane', cat: 'public safety', status: 'Resolved', by: 'u-cit-2', age: 52, sup: 3, addr: 'Velachery Main Road, service lane', lat: 12.94060, lng: 80.11730, desc: 'A dead dog is lying on the service lane since yesterday morning. Very unhygienic and distressing for children walking past. Needs immediate removal.' },
+      { id: 'CC-1009', title: 'Open storm water drain cover at Chromepet', cat: 'public safety', status: 'Submitted', by: 'u-cit-3', age: 8, sup: 2, addr: 'Chromepet, near Government Hospital', lat: 12.95140, lng: 80.14140, desc: 'The storm water drain cover is missing on the road in front of the hospital. The open drain is more than two feet deep. A scooter rider already fell here. Live danger.' },
+      { id: 'CC-1010', title: 'Water leakage from pipeline near Park Town, Tambaram', cat: 'water', status: 'Assigned', by: 'u-cit-1', age: 34, sup: 6, addr: 'Park Town, Tambaram', lat: 12.92490, lng: 80.13000, desc: 'Drinking water is leaking from a damaged pipeline joint since Sunday. Water is flowing wastefully down the road and forming a pool. Thousands of litres lost every day.' },
+      { id: 'CC-1011', title: 'Illegal dumping of construction debris on Pallavaram Road', cat: 'waste', status: 'Verified', by: 'u-cit-2', age: 46, sup: 4, addr: 'Pallavaram Road, Zamin Pallavaram', lat: 12.95970, lng: 80.14560, desc: 'A lorry dumped construction debris on the roadside overnight. It is blocking half the road and dust is affecting nearby shops. Please remove it and fine the contractor.' },
+      { id: 'CC-1012', title: 'Drainage blockage causing water stagnation', cat: 'drainage', status: 'Closed', by: 'u-cit-3', age: 150, sup: 8, addr: 'Sanatorium, Ward 13', lat: 12.92560, lng: 80.12680, desc: 'The drain in front of our street is fully blocked with silt and plastic. Water is stagnant and mosquito breeding has started. Two children in the street have fever.' },
+      { id: 'CC-1013', title: 'Street lights flickering on Perungalathur bypass', cat: 'streetlight', status: 'Submitted', by: 'u-cit-1', age: 6, sup: 2, addr: 'Perungalathur, GST bypass', lat: 12.90450, lng: 80.09260, desc: 'Five street lights flicker continuously through the night on the bypass. It is very risky for the two-wheeler traffic and looks like a wiring fault, sparks are visible.' },
+      { id: 'CC-1014', title: 'Potholes on Tambaram-Mudichur Road after rain', cat: 'road damage', status: 'Reopened', by: 'u-cit-2', age: 140, sup: 12, addr: 'Tambaram-Mudichur Road, Ward 16', lat: 12.91040, lng: 80.11190, desc: 'At least eight potholes formed on this stretch after last week rain. The patch work done last month has already come off. School buses are getting damaged. Still not repaired properly.' },
+      { id: 'CC-1015', title: 'Garbage burning in vacant plot, Selaiyur', cat: 'waste', status: 'In Progress', by: 'u-cit-3', age: 18, sup: 9, addr: 'Selaiyur, near Kalaignar Nagar', lat: 12.90690, lng: 80.13360, desc: 'Waste is being burnt in the vacant plot every evening. The smoke is heavy and my father who has asthma is suffering badly. Air pollution is severe in the evening.' },
+      { id: 'CC-1016', title: 'No street name board and dark lane at Chitlapakkam', cat: 'streetlight', status: 'Closed', by: 'u-cit-1', age: 200, sup: 3, addr: 'Chitlapakkam, Anna Nagar 2nd Street', lat: 12.93210, lng: 80.14450, desc: 'Our lane has no functioning street light for four months. Deliveries cannot find the street and there is no name board either. Please fix the lamp and the board.' },
+      { id: 'CC-1017', title: 'Water contamination — yellow water with odour', cat: 'water', status: 'In Progress', by: 'u-cit-2', age: 10, sup: 16, addr: 'Tambaram West, Ward 10', lat: 12.92100, lng: 80.11800, desc: 'Yellow coloured water with a bad smell is coming from the tap since two days. Two children in our apartment have stomach problems. This is urgent, please test the water quality.' },
+      { id: 'CC-1018', title: 'Overgrown bushes blocking footpath near school', cat: 'public safety', status: 'Verified', by: 'u-cit-3', age: 58, sup: 5, addr: 'Chitlapakkam, near Government Higher Secondary School', lat: 12.93380, lng: 80.14200, desc: 'Overgrown bushes are blocking the footpath right in front of the school gate. Children are forced to walk on the road during school hours and there is no lighting in the evening.' },
+      { id: 'CC-1019', title: 'Missing manhole cover on Pammal Main Road', cat: 'public safety', status: 'Resolved', by: 'u-cit-1', age: 70, sup: 7, addr: 'Pammal Main Road, Ward 15', lat: 12.93160, lng: 80.12900, desc: 'The manhole cover has been missing for a week. An auto rickshaw tyre got stuck yesterday. Extremely dangerous at night. Someone will fall inside.' },
+      { id: 'CC-1020', title: 'Silt and plastic blocking drain before monsoon', cat: 'drainage', status: 'Assigned', by: 'u-cit-2', age: 44, sup: 6, addr: 'Kadaperi, Tambaram', lat: 12.92060, lng: 80.11220, desc: 'The main drain from Kadaperi is full of silt and plastic bottles. If it is not desilted before the monsoon, the whole colony will flood like last year. Please clean it now.' },
+      { id: 'CC-1021', title: 'Abandoned vehicle blocking parking on GST Road', cat: 'road damage', status: 'Submitted', by: 'u-cit-3', age: 4, sup: 1, addr: 'GST Road, near Tambaram market', lat: 12.92310, lng: 80.12660, desc: 'An abandoned car has been standing for two months with no number plate. It occupies the parking space and blocks the bus bay entry. Please tow it away.' },
+      { id: 'CC-1022', title: 'Stray cattle on Tambaram bypass at night', cat: 'public safety', status: 'Verified', by: 'u-cit-1', age: 22, sup: 4, addr: 'Tambaram bypass, Ward 14', lat: 12.92660, lng: 80.12330, desc: 'Cattle are sitting on the bypass road at night because garbage is dumped there. The road is unlit and there is a real chance of an accident at speed. Please act.' },
+      { id: 'CC-1023', title: 'Broken bus shelter roof near Sanatorium', cat: 'road damage', status: 'Resolved', by: 'u-cit-2', age: 190, sup: 2, addr: 'Sanatorium bus stop, GST Road', lat: 12.92220, lng: 80.12490, desc: 'The bus shelter roof sheet is hanging loose after the wind. It looks like it will fall on the commuters waiting below. People are standing in the sun instead.' },
+      { id: 'CC-1024', title: 'Sewer smell in entire apartment block, Chromepet', cat: 'drainage', status: 'Closed', by: 'u-cit-3', age: 210, sup: 10, addr: 'Chromepet, GST Road', lat: 12.95060, lng: 80.14010, desc: 'Terrible sewer smell inside all flats in our building since last week. The drainage line behind the building is choked. Children cannot sleep at night. Please inspect urgently.' },
+      { id: 'CC-1042', title: 'Pothole at MCC west gate hitting students', cat: 'road damage', status: 'Submitted', by: 'u-x4', age: 14, sup: 0, addr: 'MCC west gate road, Tambaram', lat: 12.91895, lng: 80.12135, desc: 'There is a big pothole right at the entrance of the college west gate where students walk and cycle. Very dangerous in rain and it fills with water.', linkedTo: 'CC-1007' },
+      { id: 'CC-1043', title: 'Hazardous pothole outside college west gate', cat: 'road damage', status: 'Submitted', by: 'u-x5', age: 9, sup: 0, addr: 'Outside Madras Christian College (west gate)', lat: 12.91888, lng: 80.12125, desc: 'Deep pothole outside the college gate. Students on two-wheelers are forced to swerve onto the middle of the road. Please repair before somebody gets hurt near the college.' },
+      { id: 'CC-1044', title: 'Free gold and lucky draw — click this link', cat: 'waste', status: 'Submitted', by: 'u-x6', age: 3, sup: 0, addr: 'Tambaram Market Road', lat: 12.92330, lng: 80.12760, desc: 'Congratulations!!! You have won a lucky draw. Click www.freegold-lucky-claim.example to claim your prize now and share your bank details urgently!!!' },
+      { id: 'CC-1045', title: 'wwwwwwww', cat: 'waste', status: 'Submitted', by: 'u-x7', age: 2, sup: 0, addr: 'Tambaram', lat: 12.92030, lng: 80.12700, desc: 'asdfghhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh junk junk' }
+    ];
+
+    RAW.forEach((r, i) => {
+      const cat = categoryMeta(r.cat);
+      const createdAt = Utils.now() - r.age * H;
+      const supporters = [];
+      for (let k = 0; k < (r.sup || 0); k++) {
+        const cand = S.users[(k * 3 + i) % S.users.length].id;
+        if (cand !== r.by && !supporters.includes(cand)) supporters.push(cand);
+      }
+      const followers = supporters.slice(0, Math.max(1, Math.floor(supporters.length / 2)));
+      const base = {
+        id: r.id, title: r.title, description: r.desc, category: r.cat,
+        department: cat.dept, status: r.status,
+        location: { lat: r.lat, lng: r.lng, address: r.addr },
+        media: [Utils.placeholderImage(r.id, cat.id)],
+        reporterId: r.by, anonymous: false,
+        supporters, followers, linkedTo: r.linkedTo || null, duplicates: [], comments: [],
+        resolution: { afterPhoto: null, note: '', at: null, confirmed: null, rating: null },
+        flags: [], createdAt, slaDueAt: Utils.addHours(createdAt, cat.slaHours * 1.0)
+      };
+      // AI enrichment (the same functions the live app uses)
+      base.severity = Services.estimateSeverity(base.description, base.category, base.location).severity;
+      base.sentiment = Services.sentimentScore(base.description).score;
+      base.priority = Services.priorityScore(base, S);
+      base.priorityScore = base.priority.score;
+      base.moderation = Services.moderate(base.title + ' ' + base.description);
+      base.statusHistory = [{ status: 'Submitted', by: base.reporterId, at: createdAt, note: 'Report created' }];
+      if (['Verified', 'Assigned', 'In Progress', 'Resolved', 'Closed', 'Reopened'].includes(r.status)) base.statusHistory.push({ status: 'Verified', by: 'u-off-1', at: createdAt + 3 * H, note: 'Verified on site' });
+      if (['Assigned', 'In Progress', 'Resolved', 'Closed'].includes(r.status)) base.statusHistory.push({ status: 'Assigned', by: 'u-off-1', at: createdAt + 5 * H, note: 'Assigned to field staff' });
+      if (['In Progress', 'Resolved', 'Closed'].includes(r.status)) base.statusHistory.push({ status: 'In Progress', by: 'u-off-1', at: createdAt + 7 * H, note: 'Work started' });
+      if (['Resolved', 'Closed', 'Reopened'].includes(r.status)) {
+        base.resolution = {
+          afterPhoto: Utils.placeholderImage(r.id + '-after', 'after repair'),
+          note: 'Work completed by the ward team: surface levelled, debris cleared and the area handed back to the public.',
+          at: createdAt + 18 * H, confirmed: r.status === 'Closed' ? true : null, rating: r.status === 'Closed' ? (i % 3 === 0 ? 5 : i % 3 === 1 ? 4 : 4) : null
+        };
+        base.statusHistory.push({ status: 'Resolved', by: 'u-off-1', at: base.resolution.at, note: 'Resolution proof uploaded' });
+      }
+      if (r.status === 'Closed') base.statusHistory.push({ status: 'Closed', by: base.reporterId, at: base.resolution.at + 6 * H, note: 'Citizen confirmed the fix' });
+      if (r.status === 'Reopened') {
+        base.resolution = { afterPhoto: Utils.placeholderImage(r.id + '-after', 'after patchwork'), note: 'Patch work done on the stretch.', at: createdAt + 40 * H, confirmed: false, rating: null };
+        base.statusHistory.push({ status: 'Resolved', by: 'u-off-1', at: base.resolution.at, note: 'Resolution proof uploaded' });
+        base.statusHistory.push({ status: 'Reopened', by: base.reporterId, at: base.resolution.at + 2 * H, note: 'Patch came off in the next rain, the road is damaged again' });
+      }
+      // Moderation-driven flags (2 deliberate suspicious reports elsewhere handled below)
+      if (base.moderation.flagged) base.flags.push({ by: 'system', at: createdAt, reason: base.moderation.reasons.join('; '), status: 'open' });
+      S.complaints.push(base);
+    });
+
+    // Duplicate merge demo: CC-1042 was linked into CC-1007 and became a supporter.
+    const parent = complaint('CC-1007'), dup = complaint('CC-1042');
+    if (parent && dup) {
+      parent.duplicates.push(dup.id);
+      dup.linkedTo = parent.id;
+      const dupUser = user(dup.reporterId);
+      if (dupUser && !parent.supporters.includes(dupUser.id)) parent.supporters.push(dupUser.id);
+      dup.supporters.forEach((id) => { if (!parent.followers.includes(id)) parent.followers.push(id); });
+      dup.statusHistory.push({ status: 'Submitted', by: 'system', at: dup.createdAt + 4 * H, note: 'Merged as duplicate of ' + parent.id + ' — reporter converted to supporter' });
+      parent.priority = Services.priorityScore(parent, S); parent.priorityScore = parent.priority.score;
+    }
+    // One manual (human) flag for the admin queue besides the auto-flagged spam pair.
+    const manual = complaint('CC-1019');
+    if (manual) manual.flags.push({ by: 'u-cit-2', at: Utils.now() - 5 * H, reason: 'Photo looks like it was taken in a different street', status: 'open' });
+
+    // Historical complaints spread over the last 30 days so trend charts are not empty.
+    const HIST = [
+      ['road damage', 3], ['waste', 5], ['drainage', 2], ['water', 4], ['streetlight', 2], ['public safety', 1],
+      ['road damage', 6], ['waste', 3], ['drainage', 4], ['water', 2], ['streetlight', 3], ['public safety', 2]
+    ];
+    HIST.forEach(([catId, dayAgo], i) => {
+      const cat = categoryMeta(catId);
+      const createdAt = Utils.now() - (dayAgo * 24 + (i % 7)) * H;
+      const done = i % 4 !== 0;
+      const c = {
+        id: 'CC-20' + (10 + i), title: `${catId === 'road damage' ? 'Road patch needed' : catId === 'waste' ? 'Bin overflow' : catId === 'drainage' ? 'Drain desilting request' : catId === 'water' ? 'Low water pressure' : catId === 'streetlight' ? 'Lamp post leaning' : 'Zebra crossing faded'} — ${['Ward 11', 'Ward 12', 'Ward 13', 'Ward 14', 'Ward 15', 'Ward 16'][i % 6]}, Tambaram`,
+        description: `Historic record used for the 30-day trend: a ${catId} complaint logged by the ward volunteer team and closed after field verification in ${['Ward 11', 'Ward 12', 'Ward 13', 'Ward 14', 'Ward 15', 'Ward 16'][i % 6]}.`,
+        category: catId, department: cat.dept, status: done ? 'Closed' : 'In Progress',
+        location: { lat: 12.9210 + (rnd() - 0.5) * 0.05, lng: 80.1220 + (rnd() - 0.5) * 0.05, address: ['Ward 11', 'Ward 12', 'Ward 13', 'Ward 14', 'Ward 15', 'Ward 16'][i % 6] + ', Tambaram' },
+        media: [Utils.placeholderImage('hist' + i, catId)],
+        reporterId: S.users[i % 12 + 9].id, anonymous: i % 5 === 0,
+        supporters: [], followers: [], linkedTo: null, duplicates: [], comments: [], flags: [],
+        createdAt, slaDueAt: Utils.addHours(createdAt, cat.slaHours),
+        resolution: { afterPhoto: null, note: '', at: null, confirmed: null, rating: null },
+        statusHistory: [{ status: 'Submitted', by: 'system', at: createdAt, note: 'Imported from the ward register' }]
+      };
+      c.severity = Services.estimateSeverity(c.description, c.category, c.location).severity;
+      c.sentiment = Services.sentimentScore(c.description).score;
+      c.priority = Services.priorityScore(c, S); c.priorityScore = c.priority.score;
+      c.moderation = Services.moderate(c.title + ' ' + c.description);
+      c.statusHistory.push({ status: 'Verified', by: 'u-off-2', at: createdAt + 4 * H, note: 'Field verified' });
+      if (done) {
+        c.resolution = { afterPhoto: Utils.placeholderImage('hist' + i + '-after', 'after'), note: 'Completed and confirmed by the ward volunteer.', at: createdAt + (8 + (i % 5) * 6) * H, confirmed: true, rating: 3 + (i % 3) };
+        c.statusHistory.push({ status: 'Resolved', by: 'u-off-2', at: c.resolution.at, note: 'Resolution proof uploaded' });
+        c.statusHistory.push({ status: 'Closed', by: c.reporterId, at: c.resolution.at + 3 * H, note: 'Citizen confirmed' });
+      }
+      S.complaints.push(c);
+    });
+
+    // A friendlier seed notification set for the default demo user.
+    S.notifications = [
+      { id: 'n1', at: Utils.now() - 2 * H, read: false, kind: 'status', complaintId: 'CC-1007', title: 'CC-1007 moved to In Progress', body: 'PWD — Roads & Bridges started work at the MCC west gate.' },
+      { id: 'n2', at: Utils.now() - 26 * H, read: false, kind: 'comment', complaintId: 'CC-1001', title: 'New comment on CC-1001', body: 'Arun P.: Material is on site, work begins tomorrow 6 am.' },
+      { id: 'n3', at: Utils.now() - 40 * H, read: true, kind: 'merge', complaintId: 'CC-1007', title: 'Duplicate merged into CC-1007', body: 'CC-1042 was merged and its reporter became a supporter.' },
+      { id: 'n4', at: Utils.now() - 70 * H, read: true, kind: 'resolve', complaintId: 'CC-1004', title: 'CC-1004 resolved — please confirm', body: 'Street light replaced. Confirm or reopen from My Reports.' }
+    ];
+    S.userId = 'u-cit-1'; S.role = 'citizen';
+  }
+
+  return {
+    state: S, subscribe, emit, set,
+    /* live getters for the few call sites that read the active session directly */
+    get role() { return S.role; },
+    get lang() { return S.lang; },
+    get theme() { return S.theme; },
+    get prefs() { return S.prefs; },
+    /* lookups */
+    user, me, isGuest, isStaff, myDept, department, departmentByName, categoryMeta, complaint,
+    statusColorKey, bandFor, CAPS, can, owns,
+    /* scoping */
+    visibleComplaints, mapComplaints, myComplaints, supportedComplaints, flaggedComplaints, overdue, unreadCount,
+    computeMetrics, hotspots,
+    /* mutations */
+    addComplaint, historyAdd, logTransition, notify, markAllRead,
+    /* auth */
+    Auth, loadSeed
+  };
+})();
